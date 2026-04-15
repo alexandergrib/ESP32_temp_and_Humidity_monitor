@@ -4,9 +4,10 @@
 
 namespace proto {
 
-static constexpr uint16_t PROTOCOL_VERSION = 1;
+static constexpr uint16_t PROTOCOL_VERSION = 3;
 static constexpr uint8_t  RADIO_CHANNEL     = 6;   // must match on all nodes
-static constexpr uint32_t DEFAULT_REPORT_MS = 5000;
+static constexpr uint32_t DEFAULT_REPORT_MS = 1000;
+static constexpr uint32_t MIN_REPORT_MS     = 500;
 static constexpr uint32_t HEARTBEAT_MS      = 30000;
 static constexpr uint32_t BIND_WINDOW_MS    = 120000;
 static constexpr char MAGIC[4]              = {'T', 'M', 'O', 'N'};
@@ -18,9 +19,33 @@ enum MessageType : uint8_t {
     MSG_HEARTBEAT    = 4,
     MSG_CONFIG_SET   = 5,
     MSG_CONFIG_ACK   = 6,
-    MSG_PING         = 7,
-    MSG_PONG         = 8,
+    MSG_SAMPLE_REQ   = 7,
+    MSG_PING         = 8,
+    MSG_PONG         = 9,
+    MSG_OTA_BEGIN    = 10,
+    MSG_OTA_CHUNK    = 11,
+    MSG_OTA_END      = 12,
+    MSG_OTA_ACK      = 13,
 };
+
+enum OtaPhase : uint8_t {
+    OTA_PHASE_BEGIN = 1,
+    OTA_PHASE_CHUNK = 2,
+    OTA_PHASE_END   = 3,
+};
+
+enum OtaStatus : uint8_t {
+    OTA_STATUS_OK              = 0,
+    OTA_STATUS_REJECTED        = 1,
+    OTA_STATUS_NOT_ACTIVE      = 2,
+    OTA_STATUS_OFFSET_MISMATCH = 3,
+    OTA_STATUS_WRITE_FAILED    = 4,
+    OTA_STATUS_END_FAILED      = 5,
+    OTA_STATUS_CRC_MISMATCH    = 6,
+    OTA_STATUS_BUSY            = 7,
+};
+
+static constexpr size_t OTA_CHUNK_BYTES = 180;
 
 struct __attribute__((packed)) Header {
     char magic[4];
@@ -44,6 +69,7 @@ struct __attribute__((packed)) BindAck {
     Header header;
     uint32_t assignedNodeId;
     uint32_t reportIntervalMs;
+    float tempOffsetC;
     uint8_t controllerMac[6];
     uint8_t accepted;
     uint8_t reserved[3];
@@ -56,26 +82,60 @@ struct __attribute__((packed)) Reading {
     float vbat;
     uint8_t sensorOk;
     uint8_t rssiHint;
-    uint8_t reserved[2];
+    uint8_t reserved[2];   // reserved[0]=fwMajor, reserved[1]=fwMinor
 };
 
 struct __attribute__((packed)) Heartbeat {
     Header header;
     uint8_t sensorOk;
     uint8_t wifiChannel;
-    uint16_t reserved;
+    uint16_t reserved;     // low byte=fwMajor, high byte=fwMinor
 };
 
 struct __attribute__((packed)) ConfigSet {
     Header header;
     uint32_t reportIntervalMs;
+    float tempOffsetC;
 };
 
 struct __attribute__((packed)) ConfigAck {
     Header header;
     uint32_t reportIntervalMs;
+    float tempOffsetC;
     uint8_t applied;
     uint8_t reserved[3];
+};
+
+struct __attribute__((packed)) SampleRequest {
+    Header header;
+};
+
+struct __attribute__((packed)) OtaBegin {
+    Header header;
+    uint32_t totalSize;
+    uint32_t expectedCrc32;
+};
+
+struct __attribute__((packed)) OtaChunk {
+    Header header;
+    uint32_t offset;
+    uint16_t dataLen;
+    uint16_t reserved;
+    uint8_t data[OTA_CHUNK_BYTES];
+};
+
+struct __attribute__((packed)) OtaEnd {
+    Header header;
+    uint32_t totalSize;
+    uint32_t expectedCrc32;
+};
+
+struct __attribute__((packed)) OtaAck {
+    Header header;
+    uint8_t phase;
+    uint8_t status;
+    uint16_t detail;
+    uint32_t bytesReceived;
 };
 
 inline void fillHeader(Header& h, MessageType type, uint32_t sequence, uint32_t nodeId, uint32_t uptimeMs) {
