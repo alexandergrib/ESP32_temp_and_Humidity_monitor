@@ -23,7 +23,7 @@ except ImportError:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", required=True, help="Serial port, e.g. COM7 or /dev/ttyUSB0")
-    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--baud", type=int, default=460800)
     parser.add_argument("--csv", default="readings.csv")
     args = parser.parse_args()
 

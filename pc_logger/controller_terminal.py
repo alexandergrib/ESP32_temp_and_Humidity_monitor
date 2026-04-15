@@ -42,7 +42,7 @@ def serial_reader(ser: serial.Serial, stop_event: threading.Event) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", required=True, help="Controller serial port, e.g. COM6")
-    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--baud", type=int, default=460800)
     args = parser.parse_args()
 
     with serial.Serial(args.port, args.baud, timeout=0.2) as ser:

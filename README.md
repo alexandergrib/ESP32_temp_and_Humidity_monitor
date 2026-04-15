@@ -1,55 +1,20 @@
-# ESP32 Remote Temperature and Humidity Monitor
+# ESP32 Temperature Monitor
 
-## Scope
+ESP32 controller + one or more ESP32 satellites with SHT85 sensors.
 
-This design uses:
+- Controller talks to the PC over USB serial.
+- Satellites talk to the controller over ESP-NOW on channel `6`.
+- Satellites only send readings when the controller requests them.
+- Satellite OTA is performed through the controller.
 
-- **1 x controller ESP32** connected to the PC by **USB serial only**
-- **N x satellite ESP32 nodes** connected to **1 x SHT85 sensor each**
-- **ESP-NOW** for controller ↔ satellite wireless transport
-- **No dependency on a router, external Wi-Fi network, or cloud service**
-
-The design is intended to scale from your current **2 satellites** to more nodes later without changing the controller firmware logic. ESP-NOW is suitable here because it supports direct device-to-device communication without a router, small telemetry packets, and a one-to-many / many-to-one topology on ESP32. The practical payload size is limited, and all nodes must operate on the same Wi‑Fi channel. citeturn514375view0turn649005search3turn649005search6
-
----
-
-## Assumptions
-
-- Your sensor name **Sensirion SHT85**.
-- Each satellite has **one SHT85** connected over I2C.
-- The controller does **not** read sensors directly.
-- The PC software can read newline-delimited serial output from the controller.
-
-The SHT85 is a high-accuracy digital humidity and temperature sensor in the SHT3x family. It uses I2C and is a good fit for distributed sensor nodes. 
-
----
-
-## Why ESP-NOW instead of Wi-Fi AP or Bluetooth
-
-### Chosen transport: ESP-NOW
-
-ESP-NOW is the recommended baseline for this project because:
-
-- no router or infrastructure is required
-- latency is low
-- node count can grow without the controller caring about a fixed number of satellites
-- controller can still remain USB-only toward the PC
-- implementation is simpler and lighter than maintaining a custom Wi‑Fi AP protocol stack or BLE GATT service
-
-### Not chosen as primary transport
-
-#### SoftAP + TCP/UDP
-
-This is viable, but it adds IP addressing, socket handling, reconnection logic, and AP/client management that is unnecessary for small telemetry packets.
-
-#### BLE
-
-BLE is possible, but multi-node collection, discovery, and characteristic design become more complex than needed for a simple many-to-one telemetry bus.
-
----
-
-## System architecture
-
+#wiring
+```text
+SHT85 - ESP32
+1 WHITE SCL -> P22
+2 RED VCC -> 3v3
+3 BLACK GND - GND
+4 GREEN SDA -> P21
+```
 ```text
 +--------------------+       USB Serial       +-------------------------+
 |      Computer      | <--------------------> |    ESP32 Controller     |
@@ -67,373 +32,299 @@ BLE is possible, but multi-node collection, discovery, and characteristic design
       +-------------------+                     +-------------------+               +-------------------+
 ```
 
-### Roles
-
-#### Controller node
-
-- fixed ESP-NOW channel
-- receives readings from any bound satellite
-- stores node registry in flash (`Preferences`)
-- exposes events and telemetry to the PC over USB serial
-- accepts simple serial commands such as opening a bind window or changing report interval
-
-#### Satellite node
-
-- reads local SHT85 over I2C
-- binds to controller on first boot or after reset
-- stores controller MAC, assigned node ID, and report interval in flash
-- periodically transmits readings and heartbeat frames
-
----
-
-## Wireless model
-
-### Channel model
-
-All nodes must use the same Wi-Fi channel. In this starter implementation the channel is hardcoded to:
-
-- **Channel 6**
-
-This is a deliberate simplification. If you later need coexistence with an existing Wi‑Fi network, move all project nodes together to a different fixed channel.
-
-### Addressing model
-
-The controller does **not** have a hardcoded list of satellites.
-
-Instead:
-
-- each satellite starts as **unbound**
-- it broadcasts a **bind request**
-- the controller accepts it only while the **bind window** is open
-- the controller assigns a new `nodeId`
-- both ends save the relationship in non-volatile storage
-
-This means the controller logic scales to **dynamic node counts**.
-
----
-
-## Protocol design
-
-All ESP-NOW frames use a packed binary payload with a common header.
-
-### Common header
-
-| Field | Type | Purpose |
-|---|---:|---|
-| magic | 4 bytes | Protocol signature: `TMON` |
-| version | uint16 | Protocol version |
-| type | uint8 | Message type |
-| sequence | uint32 | Monotonic sender sequence |
-| nodeId | uint32 | Logical node ID |
-| uptimeMs | uint32 | Sender uptime |
-
-### Message types
-
-| Type | Direction | Purpose |
-|---|---|---|
-| `MSG_BIND_REQUEST` | satellite → broadcast | Ask a controller to pair |
-| `MSG_BIND_ACK` | controller → satellite | Assign node ID and config |
-| `MSG_READING` | satellite → controller | Temperature/humidity payload |
-| `MSG_HEARTBEAT` | satellite → controller | Keepalive / health |
-| `MSG_CONFIG_SET` | controller → satellite | Update interval |
-| `MSG_CONFIG_ACK` | satellite → controller | Confirm config applied |
-| `MSG_PING` | controller → satellite | Optional probe |
-| `MSG_PONG` | satellite → controller | Reserved for future |
-
-### Reading payload
-
-| Field | Type |
-|---|---:|
-| temperatureC | float |
-| humidityPct | float |
-| vbat | float |
-| sensorOk | uint8 |
-| rssiHint | uint8 |
-
-`vbat` is currently reserved and sent as `NaN` in the starter firmware.
-
----
-
-## Binding flow
+## Repository Layout
 
 ```text
-Satellite boots unbound
-    ↓
-Broadcasts MSG_BIND_REQUEST every 3 s
-    ↓
-Controller bind window is open
-    ↓
-Controller assigns next nodeId and stores MAC/name
-    ↓
-Controller replies with MSG_BIND_ACK
-    ↓
-Satellite stores controller MAC + nodeId + report interval
-    ↓
-Satellite starts periodic telemetry
+esp32_temp_monitor/
+|- controller/
+|  |- controller.ino
+|  |- protocol.h
+|- satellite/
+|  |- satellite.ino
+|  |- protocol.h
+|- shared/
+|  |- protocol.h
+|- src/
+|  |- main.cpp
+|  |- satellite_main.cpp
+|- pc_logger/
+|  |- controller_terminal.py
+|  |- ota_satellite.py
+|- platformio.ini
 ```
 
-### Controller behavior
+## Hardware
 
-- bind window opens automatically on boot for 120 s
-- can be opened again over serial with `BIND`
-- can be closed with `BIND OFF`
+### Controller
 
-### Satellite behavior
+- ESP32 board connected to the PC by USB
 
-- if not bound, it only attempts pairing
-- if bound, it skips pairing and starts normal operation
+### Satellite
 
----
+- ESP32 board
+- SHT85 sensor on I2C
 
-## USB serial interface to PC
-
-The controller emits **JSON lines** so a Python logger, terminal app, or GUI can parse them easily.
-
-### Example telemetry output
-
-```json
-{"event":"reading","node_id":1,"name":"satellite","temperature_c":24.31,"humidity_pct":46.90,"sensor_ok":true,"mac":"A0:B7:65:11:22:33"}
-```
-
-### Example controller events
-
-```json
-{"event":"controller_ready","channel":6}
-{"event":"node_bound","node_id":1,"name":"satellite","mac":"A0:B7:65:11:22:33"}
-{"event":"heartbeat","node_id":1,"name":"satellite","channel":6}
-{"event":"config_ack","node_id":1,"report_interval_ms":5000,"applied":true}
-```
-
-### Serial commands accepted by controller
-
-| Command | Function |
-|---|---|
-| `HELP` | Print available commands |
-| `NODES` | List known nodes |
-| `BIND` | Open bind window for 120 s |
-| `BIND OFF` | Close bind window |
-| `SETINT <nodeId> <ms>` | Set report interval on a node |
-
----
-
-## Wiring
-
-## Satellite ESP32 ↔ SHT85
-
-This starter firmware assumes the common ESP32 I2C pins:
+Default I2C pins used by the satellite firmware:
 
 - `GPIO21` = SDA
 - `GPIO22` = SCL
 
-### Basic wiring
+Keep the SHT85 physically away from the ESP32 module and regulator if you want realistic temperature readings.
 
-| SHT85 | ESP32 |
-|---|---|
-| VCC | 3V3 |
-| GND | GND |
-| SDA | GPIO21 |
-| SCL | GPIO22 |
+## Requirements
 
-### Notes
+- Python 3
+- PlatformIO
+- `pyserial`
 
-- The SHT85 uses I2C and, in common usage, is on address `0x44` with this library family.
-- Use **3.3 V**, not 5 V, unless your specific breakout explicitly supports level shifting and 5 V input.
-- Keep wires short for clean measurements.
-- Put the sensor away from ESP32 heat if you want more accurate temperature readings.
+Install the Python tools:
 
-The SHT85 belongs to the SHT3x-compatible family, and Arduino support exists for SHT85/SHT3x devices. citeturn649005search2turn649005search5turn649005search19
-
----
-
-## Firmware files
-
-```text
-esp32_temp_monitor/
-├── README.md
-├── shared/
-│   └── protocol.h
-├── controller/
-│   └── controller.ino
-└── satellite/
-    └── satellite.ino
+```bash
+pip install platformio pyserial
 ```
 
-### `shared/protocol.h`
+## Build
 
-Contains:
+Build controller firmware:
 
-- protocol constants
-- packed message structs
-- common helper functions
+```bash
+python -m platformio run -e controller_upload
+```
 
-### `controller/controller.ino`
+Build satellite firmware:
 
-Implements:
+```bash
+python -m platformio run -e satellite_upload
+```
 
-- ESP-NOW receiver
-- node registry in flash
-- dynamic binding
-- serial JSON output
-- serial command handling
+## Flash Over USB
 
-### `satellite/satellite.ino`
+Flash the controller on `COM6`:
 
-Implements:
+```bash
+python -m platformio run -e controller_upload -t upload
+```
 
-- SHT85 reading
-- first-time binding
-- periodic reading transmit
-- heartbeat transmit
-- flash-stored binding/configuration
+Flash a satellite on `COM6`:
 
----
+```bash
+python -m platformio run -e satellite_upload -t upload
+```
 
-## Software dependencies
+`platformio.ini` already contains the upload environments used above.
 
-### Arduino IDE / ESP32 core
+## OTA Update For Satellites
 
-You need the ESP32 Arduino core installed. ESP-NOW support is part of the ESP32 Arduino environment. citeturn649005search0turn649005search3turn649005search12
+Satellite OTA goes through the controller serial port. The controller itself is still updated over USB flash, not OTA.
 
-### Arduino libraries
+Build the satellite firmware first:
 
-Install:
+```bash
+python -m platformio run -e satellite_upload
+```
 
-- **SHT85** by Rob Tillaart, or another compatible SHT85/SHT3x Arduino library
+Then upload to a satellite node through the controller:
 
-This starter firmware is written against the `SHT85.h` library API. The Arduino library index shows current SHT85 support. citeturn649005search2turn649005search8
+```bash
+#python pc_logger\ota_satellite.py --port COM6 --node-id 1 --firmware .pio\build\satellite_upload\firmware.bin
+python pc_logger\ota_satellite.py --port COM6 --node-id 1 --firmware .pio\build\satellite_upload\firmware.bin
+python pc_logger\ota_satellite.py --port COM6 --node-id 2 --firmware .pio\build\satellite_upload\firmware.bin
+```
 
----
+The OTA helper now quiets other known satellites first by temporarily moving them to a long poll interval, then restores their previous interval after a successful transfer. Use OTA one satellite at a time.
 
-## Setup procedure
+## Terminal / Serial Use
 
-## 1. Install libraries
+Controller serial settings:
 
-In Arduino IDE:
+- Port: `COM6`
+- Baud: `115200`
+- Data bits: `8`
+- Stop bits: `1`
+- Parity: `None`
+- Flow control: `None`
 
-- install ESP32 board support
-- install the `SHT85` library
+The controller boots with streaming disabled, so you get a prompt first.
 
-## 2. Open firmware
+Recommended terminal helper:
 
-- flash `controller/controller.ino` to the controller ESP32
-- flash `satellite/satellite.ino` to each satellite ESP32
+```bash
+python pc_logger\controller_terminal.py --port COM6
+```
 
-## 3. Power and connect
+That helper:
 
-- connect controller ESP32 to the computer over USB
-- power satellites over USB or stable 5 V input to their boards
-- connect one SHT85 to each satellite board
+- opens the controller serial port
+- pushes current PC time into the controller
+- lets you type controller commands interactively
 
-## 4. Pair satellites
+You can also use PuTTY or another serial terminal.
 
-- power controller first
-- within the initial 120 s bind window, power a satellite
-- satellite broadcasts bind requests until controller accepts
-- repeat for each additional satellite
+## Controller Commands
 
-If you miss the window:
+Available controller commands:
 
-- open serial monitor on controller
-- send `BIND`
-- power or reset the satellite
+- `HELP`
+- `NODES`
+- `BIND`
+- `BIND OFF`
+- `STREAM ON`
+- `STREAM OFF`
+- `SETINT <nodeId> <ms>`
+- `SETINT ALL <ms>`
+- `SETSAMPLE <nodeId> <hz>`
+- `SETSAMPLE ALL <hz>`
+- `SETTOFF <nodeId> <tempOffsetC>`
+- `HEATER <nodeId> ON`
+- `HEATER <nodeId> OFF`
+- `RENAME <nodeId> <name>`
+- `TIME STATUS`
+- `TIME SET <unixSeconds>`
+- `OTA BEGIN <nodeId> <size> <crc32hex>`
+- `OTA CHUNK <offset> <hex>`
+- `OTA END`
+- `OTA STATUS`
+- `OTA ABORT`
 
-## 5. Verify operation
+## Command Notes
 
-On controller serial output you should see:
+### `NODES`
 
-- `controller_ready`
-- `node_bound`
-- repeated `reading` events
-- periodic `heartbeat` events
+Prints stored node information, including:
 
----
+- `node_id`
+- `name`
+- `mac`
+- `report_interval_ms`
+- `fw_version`
+- `rssi_dbm`
+- `signal_pct`
+- `temp_offset_c`
+- `heater_enabled`
+- `sample_rate_hz`
 
-## Rebinding and replacement
+### `SETINT`
 
-### Replace a satellite board
+Changes how often the controller polls a satellite.
 
-If a satellite ESP32 is replaced, it will have a different MAC address and should be treated as a new node.
+Example:
 
-### Force a satellite to forget binding
+```text
+SETINT 1 1000
+```
 
-Current starter firmware does not expose a serial reset command on the satellite. For now, erase flash or modify firmware to clear `Preferences`.
+### `SETSAMPLE`
 
-A future extension can add:
+Changes the satellite background sample rate and stores it in flash on the satellite.
+The satellite keeps sampling continuously, collapses those samples into `10 ms` chunk
+averages, and returns the average of the stored chunks when the controller polls it.
 
-- long-press GPIO button to clear binding
-- serial command on satellite to factory reset
-- controller-side delete-node command
+Examples:
 
----
+```text
+SETSAMPLE 1 200
+SETSAMPLE ALL 100
+```
 
-## Functions implemented
+### `SETTOFF`
 
-### Controller functions
+Applies a temperature offset on the satellite.
 
-- dynamic node registration
-- node persistence across power cycles
-- JSON serial telemetry export
-- simple runtime commands
-- bind window control
+Example:
 
-### Satellite functions
+```text
+SETTOFF 1 -1.50
+```
 
-- automatic first-time pairing
-- periodic temperature/humidity reporting
-- heartbeat reporting
-- persistent config storage
-- remote report interval update
+### `HEATER`
 
----
+Turns the SHT85 heater on or off on a satellite.
 
-## Known limitations of this starter design
+Examples:
 
-- no encryption enabled on ESP-NOW yet
-- fixed channel only
-- no battery measurement yet
-- no RTC timestamp in the node payload
-- no packet retry queue beyond ESP-NOW delivery behavior
-- no PC-side logger application included yet
-- assumes one SHT85 per satellite
+```text
+HEATER 1 ON
+HEATER 1 OFF
+```
 
----
+### `RENAME`
 
-## Recommended next upgrades
+Renames a satellite from the controller and stores the new name in flash on the satellite,
+so it survives power loss and reboot.
 
-### Priority 1
+Example:
 
-- add CRC or application-level integrity field
-- add battery voltage measurement on satellites
-- add node delete/reset commands
-- add PC-side Python logger that stores CSV and plots data
+```text
+RENAME 1 greenhouse
+```
 
-### Priority 2
+### `STREAM`
 
-- add ESP-NOW encryption and key provisioning
-- add optional OLED status screen on controller
-- add watchdog and sensor fault counters
-- add time synchronization from controller to nodes
+- `STREAM ON` enables live JSON telemetry
+- `STREAM OFF` stops live telemetry and leaves the prompt quiet
 
-### Priority 3
+## Example Workflow
 
-- optional Wi‑Fi AP on controller for browser dashboard
-- optional PC tray app or desktop GUI
-- OTA firmware updates over Wi‑Fi for satellites
+### First-time programming
 
----
+1. Flash the controller over USB.
+2. Flash each satellite over USB once.
+3. Power all devices.
+4. Open the controller terminal.
+5. Use `BIND` if needed.
+6. Check `NODES`.
 
-## Build notes
+### Normal use
 
-This is **starter firmware and project infrastructure**, not a finished production product. It is designed to give you:
+1. Connect to the controller.
+2. Use `NODES` to inspect satellites.
+3. Use `STREAM ON` to watch live data.
+4. Use `SETINT`, `SETTOFF`, or `HEATER` as needed.
 
-- a scalable topology
-- a concrete protocol
-- pairable nodes
-- a clean path to logging software on the PC
+### Satellite firmware rollout
 
-For your stated requirement, this is the most direct structure:
+1. Build `satellite_upload`.
+2. OTA one satellite at a time through the controller with `ota_satellite.py`.
+3. If the controller firmware changed too, flash the controller over USB last.
 
-- **USB only** from controller to computer
-- **wireless only** from controller to satellites
-- **controller independent of satellite count**
+If the satellite protocol changed, the safe order is:
 
+1. OTA satellites first while the old controller can still talk to them.
+2. Flash the controller last.
+
+If an OTA transfer is interrupted, reset that satellite before retrying.
+
+## Satellite LED Status
+
+The built-in LED on each satellite is used as a simple state indicator:
+
+- unbound: double blink
+- bound and idle: short heartbeat pulse
+- radio activity such as bind/config/sample/OTA ack traffic: brief solid pulse
+- OTA in progress: fast blink
+- OTA complete, waiting to reboot: solid on
+
+## Output Format
+
+Example reading:
+
+```json
+{"event":"reading","node_id":1,"name":"satellite","temperature_c":22.54,"humidity_pct":47.16,"sensor_ok":true,"fw_version":"2.1","rssi_dbm":-50,"signal_pct":100,"mac":"1C:C3:AB:C2:1E:7C"}
+```
+
+Example nodes response:
+
+```json
+{"event":"nodes","items":[{"node_id":1,"name":"satellite","mac":"1C:C3:AB:C2:1E:7C","last_seen_ms":12638,"report_interval_ms":1000,"fw_version":"2.1","rssi_dbm":-51,"signal_pct":97,"temp_offset_c":0.00,"heater_enabled":false,"next_poll_in_ms":955}]}
+```
+
+## Current Behavior
+
+- Controller stream is off by default at boot.
+- Controller polls satellites and spaces polls automatically when multiple satellites are present.
+- Satellites sample the SHT85 continuously at a configurable target rate up to `200 Hz`.
+- Poll responses are averaged from stored `10 ms` sample chunks, not a single instant read.
+- Time can be pushed in from the connected host terminal.
+- Satellite firmware version is reported to the controller.
+- RSSI is reported as both `rssi_dbm` and `signal_pct`.
+- Satellite heater state is controlled by the controller and stored in flash.

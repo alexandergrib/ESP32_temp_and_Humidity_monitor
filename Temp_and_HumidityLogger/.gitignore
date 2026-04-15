@@ -1,0 +1,5 @@
+.venv
+old C-sharm
+log*
+data.csv
+logger.*

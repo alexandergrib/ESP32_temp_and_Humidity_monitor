@@ -8,6 +8,8 @@
 
 using namespace proto;
 
+static constexpr uint32_t SERIAL_BAUD = 460800;
+
 Preferences prefs;
 
 #ifndef LED_BUILTIN
@@ -19,6 +21,7 @@ static constexpr uint8_t STATUS_LED_PIN = LED_BUILTIN;
 static constexpr uint32_t STATUS_LED_PERIOD_MS = 1000;
 static constexpr uint32_t STATUS_LED_ON_MS = 80;
 static constexpr uint32_t MIN_POLL_GAP_MS = 120;
+static constexpr uint32_t OFFLINE_REPROBE_MS = 2000;
 static constexpr uint32_t OTA_ACK_TIMEOUT_MS = 1500;
 static constexpr uint8_t OTA_MAX_RETRIES = 3;
 static constexpr uint32_t RSSI_CACHE_MAX_AGE_MS = 1500;
@@ -41,6 +44,8 @@ struct NodeRecord {
     uint8_t fwMajor = 0;
     uint8_t fwMinor = 0;
     int8_t lastRssiDbm = 0;
+    bool heaterEnabled = false;
+    uint16_t sampleRateHz = DEFAULT_SAMPLE_RATE_HZ;
     float tempOffsetC = 0.0f;
     uint32_t nextPollDueAtMs = 0;
 };
@@ -90,6 +95,7 @@ void handleIncomingPacket(const uint8_t* mac, const uint8_t* data, int len, int8
 void logSendStatus(esp_now_send_status_t status);
 void rebuildPollSchedule();
 void handleOtaAck(const uint8_t* mac, const OtaAck& ack);
+void handleRenameAck(const uint8_t* mac, const RenameAck& ack);
 void retryPendingOtaFrame();
 void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type);
 
@@ -99,6 +105,36 @@ bool timeReached(uint32_t now, uint32_t target) {
 
 uint32_t normalizeReportInterval(uint32_t ms) {
     return max(ms, MIN_REPORT_MS);
+}
+
+uint16_t normalizeSampleRateHz(uint32_t hz) {
+    return static_cast<uint16_t>(constrain(hz, MIN_SAMPLE_RATE_HZ, MAX_SAMPLE_RATE_HZ));
+}
+
+String sanitizeNodeName(String name) {
+    name.trim();
+    String sanitized;
+    sanitized.reserve(15);
+    for (size_t i = 0; i < name.length() && sanitized.length() < 15; ++i) {
+        const char c = name[i];
+        if ((c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '_' || c == '-' || c == ' ') {
+            sanitized += c;
+        }
+    }
+    sanitized.trim();
+    if (sanitized.length() == 0) sanitized = "satellite";
+    return sanitized;
+}
+
+bool nodeNeedsFastProbe(const NodeRecord& node, uint32_t now) {
+    if (!node.used) return false;
+    if (node.lastSeenMs == 0) return true;
+
+    const uint32_t staleAfterMs = max<uint32_t>(OFFLINE_REPROBE_MS * 2, normalizeReportInterval(node.reportIntervalMs) * 3);
+    return now - node.lastSeenMs >= staleAfterMs;
 }
 
 uint8_t rssiToSignalPercent(int8_t rssiDbm) {
@@ -258,6 +294,8 @@ void saveNode(size_t i) {
     prefs.putUChar((base + "fwmaj").c_str(), nodes[i].fwMajor);
     prefs.putUChar((base + "fwmin").c_str(), nodes[i].fwMinor);
     prefs.putFloat((base + "toff").c_str(), nodes[i].tempOffsetC);
+    prefs.putBool((base + "heat").c_str(), nodes[i].heaterEnabled);
+    prefs.putUShort((base + "srhz").c_str(), nodes[i].sampleRateHz);
 }
 
 void loadNodes() {
@@ -278,6 +316,8 @@ void loadNodes() {
         nodes[i].fwMajor = prefs.getUChar((base + "fwmaj").c_str(), 0);
         nodes[i].fwMinor = prefs.getUChar((base + "fwmin").c_str(), 0);
         nodes[i].tempOffsetC = prefs.getFloat((base + "toff").c_str(), 0.0f);
+        nodes[i].heaterEnabled = prefs.getBool((base + "heat").c_str(), false);
+        nodes[i].sampleRateHz = normalizeSampleRateHz(prefs.getUShort((base + "srhz").c_str(), DEFAULT_SAMPLE_RATE_HZ));
     }
 }
 
@@ -301,21 +341,37 @@ void sendBindAck(const uint8_t* mac, const NodeRecord& node) {
     ack.assignedNodeId = node.nodeId;
     ack.reportIntervalMs = normalizeReportInterval(node.reportIntervalMs);
     ack.tempOffsetC = node.tempOffsetC;
+    ack.heaterEnabled = node.heaterEnabled ? 1 : 0;
+    ack.sampleRateHz = normalizeSampleRateHz(node.sampleRateHz);
     WiFi.macAddress(ack.controllerMac);
     ack.accepted = 1;
     ensurePeer(mac);
     esp_now_send(mac, reinterpret_cast<const uint8_t*>(&ack), sizeof(ack));
 }
 
-void sendConfig(uint32_t nodeId, uint32_t reportIntervalMs, float tempOffsetC) {
+void sendConfig(uint32_t nodeId, uint32_t reportIntervalMs, float tempOffsetC, bool heaterEnabled, uint16_t sampleRateHz) {
     int idx = findNodeById(nodeId);
     if (idx < 0) return;
     ConfigSet cfg{};
     fillHeader(cfg.header, MSG_CONFIG_SET, txSeq++, nodeId, millis());
     cfg.reportIntervalMs = normalizeReportInterval(reportIntervalMs);
     cfg.tempOffsetC = tempOffsetC;
+    cfg.heaterEnabled = heaterEnabled ? 1 : 0;
+    cfg.sampleRateHz = normalizeSampleRateHz(sampleRateHz);
     ensurePeer(nodes[idx].mac);
     esp_now_send(nodes[idx].mac, reinterpret_cast<const uint8_t*>(&cfg), sizeof(cfg));
+}
+
+void sendRename(uint32_t nodeId, const String& requestedName) {
+    int idx = findNodeById(nodeId);
+    if (idx < 0) return;
+
+    const String sanitizedName = sanitizeNodeName(requestedName);
+    RenameSet msg{};
+    fillHeader(msg.header, MSG_RENAME_SET, txSeq++, nodeId, millis());
+    sanitizedName.toCharArray(msg.nodeName, sizeof(msg.nodeName));
+    ensurePeer(nodes[idx].mac);
+    esp_now_send(nodes[idx].mac, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
 }
 
 void sendSampleRequest(size_t idx) {
@@ -443,7 +499,9 @@ void rebuildPollSchedule() {
     uint32_t shortestIntervalMs = UINT32_MAX;
     for (const NodeRecord& node : nodes) {
         if (!node.used) continue;
-        shortestIntervalMs = min(shortestIntervalMs, normalizeReportInterval(node.reportIntervalMs));
+        const uint32_t effectiveIntervalMs =
+            nodeNeedsFastProbe(node, now) ? OFFLINE_REPROBE_MS : normalizeReportInterval(node.reportIntervalMs);
+        shortestIntervalMs = min(shortestIntervalMs, effectiveIntervalMs);
     }
 
     const uint32_t spacingMs = max(MIN_POLL_GAP_MS, shortestIntervalMs / activeCount);
@@ -475,7 +533,9 @@ void pollSatellites() {
     if (dueIdx < 0) return;
 
     sendSampleRequest(static_cast<size_t>(dueIdx));
-    nodes[dueIdx].nextPollDueAtMs = now + normalizeReportInterval(nodes[dueIdx].reportIntervalMs);
+    const uint32_t nextDelayMs =
+        nodeNeedsFastProbe(nodes[dueIdx], now) ? OFFLINE_REPROBE_MS : normalizeReportInterval(nodes[dueIdx].reportIntervalMs);
+    nodes[dueIdx].nextPollDueAtMs = now + nextDelayMs;
     lastPollSentAt = now;
 }
 
@@ -497,12 +557,12 @@ void handleBindRequest(const uint8_t* mac, const BindRequest& req) {
         prefs.putUInt("nextNodeId", nextNodeId);
     }
 
-    strncpy(nodes[idx].name, req.nodeName, sizeof(nodes[idx].name) - 1);
-    nodes[idx].name[sizeof(nodes[idx].name) - 1] = '\0';
+    sanitizeNodeName(String(req.nodeName)).toCharArray(nodes[idx].name, sizeof(nodes[idx].name));
     nodes[idx].fwMajor = req.fwMajor;
     nodes[idx].fwMinor = req.fwMinor;
     if (isNewNode) {
         nodes[idx].reportIntervalMs = DEFAULT_REPORT_MS;
+        nodes[idx].sampleRateHz = DEFAULT_SAMPLE_RATE_HZ;
     }
     nodes[idx].lastSeenMs = millis();
     saveNode(idx);
@@ -540,37 +600,42 @@ void handleReading(const uint8_t* mac, const Reading& msg, int8_t rssiDbm) {
     );
 }
 
-void handleHeartbeat(const uint8_t* mac, const Heartbeat& msg, int8_t rssiDbm) {
-    int idx = findNodeByMac(mac);
-    if (idx < 0) return;
-    nodes[idx].lastSeenMs = millis();
-    nodes[idx].sensorOk = msg.sensorOk;
-    nodes[idx].fwMajor = static_cast<uint8_t>(msg.reserved & 0xFF);
-    nodes[idx].fwMinor = static_cast<uint8_t>((msg.reserved >> 8) & 0xFF);
-    nodes[idx].lastRssiDbm = rssiDbm;
-
-    printJsonEvent(
-        "{\"event\":\"heartbeat\",\"node_id\":" + String(nodes[idx].nodeId) +
-        ",\"name\":\"" + String(nodes[idx].name) +
-        "\",\"channel\":" + String(msg.wifiChannel) +
-        ",\"fw_version\":\"" + String(nodes[idx].fwMajor) + "." + String(nodes[idx].fwMinor) + "\"" +
-        ",\"rssi_dbm\":" + String(nodes[idx].lastRssiDbm) +
-        ",\"signal_pct\":" + String(rssiToSignalPercent(nodes[idx].lastRssiDbm)) + "}"
-    );
-}
-
 void handleConfigAck(const uint8_t* mac, const ConfigAck& msg) {
     int idx = findNodeByMac(mac);
     if (idx < 0) return;
+    nodes[idx].lastSeenMs = millis();
     nodes[idx].reportIntervalMs = normalizeReportInterval(msg.reportIntervalMs);
     nodes[idx].tempOffsetC = msg.tempOffsetC;
+    nodes[idx].heaterEnabled = msg.heaterEnabled != 0;
+    nodes[idx].sampleRateHz = normalizeSampleRateHz(msg.sampleRateHz);
     saveNode(idx);
     rebuildPollSchedule();
     printJsonEvent(
         "{\"event\":\"config_ack\",\"node_id\":" + String(nodes[idx].nodeId) +
         ",\"report_interval_ms\":" + String(nodes[idx].reportIntervalMs) +
         ",\"temp_offset_c\":" + String(nodes[idx].tempOffsetC, 2) +
+        ",\"heater_enabled\":" + String(nodes[idx].heaterEnabled ? "true" : "false") +
+        ",\"sample_rate_hz\":" + String(nodes[idx].sampleRateHz) +
         ",\"applied\":" + String(msg.applied ? "true" : "false") + "}"
+    );
+}
+
+void handleRenameAck(const uint8_t* mac, const RenameAck& ack) {
+    int idx = findNodeByMac(mac);
+    if (idx < 0) return;
+
+    const String sanitizedName = sanitizeNodeName(String(ack.nodeName));
+    if (ack.applied) {
+        sanitizedName.toCharArray(nodes[idx].name, sizeof(nodes[idx].name));
+        nodes[idx].lastSeenMs = millis();
+        saveNode(static_cast<size_t>(idx));
+    }
+
+    printJsonEvent(
+        "{\"event\":\"rename_ack\",\"node_id\":" + String(nodes[idx].nodeId) +
+        ",\"name\":\"" + sanitizedName +
+        "\",\"applied\":" + String(ack.applied ? "true" : "false") + "}",
+        true
     );
 }
 
@@ -587,6 +652,13 @@ void handleOtaAck(const uint8_t* mac, const OtaAck& ack) {
         "\",\"bytes_received\":" + String(ack.bytesReceived) +
         ",\"detail\":" + String(ack.detail) + "}"
     );
+
+    if (ack.phase == OTA_PHASE_BEGIN && ack.status == OTA_STATUS_BUSY) {
+        otaSession.awaitingAck = false;
+        otaSession.nextOffset = ack.bytesReceived;
+        otaSession.bytesReceived = ack.bytesReceived;
+        return;
+    }
 
     if (ack.status != OTA_STATUS_OK) {
         if (ack.status == OTA_STATUS_OFFSET_MISMATCH) {
@@ -634,11 +706,11 @@ void handleIncomingPacket(const uint8_t* mac, const uint8_t* data, int len, int8
         case MSG_READING:
             if (len == sizeof(Reading)) handleReading(mac, *reinterpret_cast<const Reading*>(data), rssiDbm);
             break;
-        case MSG_HEARTBEAT:
-            if (len == sizeof(Heartbeat)) handleHeartbeat(mac, *reinterpret_cast<const Heartbeat*>(data), rssiDbm);
-            break;
         case MSG_CONFIG_ACK:
             if (len == sizeof(ConfigAck)) handleConfigAck(mac, *reinterpret_cast<const ConfigAck*>(data));
+            break;
+        case MSG_RENAME_ACK:
+            if (len == sizeof(RenameAck)) handleRenameAck(mac, *reinterpret_cast<const RenameAck*>(data));
             break;
         case MSG_OTA_ACK:
             if (len == sizeof(OtaAck)) handleOtaAck(mac, *reinterpret_cast<const OtaAck*>(data));
@@ -713,6 +785,8 @@ void listNodes() {
         Serial.print(",\"rssi_dbm\":"); Serial.print(nodes[i].lastRssiDbm);
         Serial.print(",\"signal_pct\":"); Serial.print(rssiToSignalPercent(nodes[i].lastRssiDbm));
         Serial.print(",\"temp_offset_c\":"); Serial.print(nodes[i].tempOffsetC, 2);
+        Serial.print(",\"heater_enabled\":"); Serial.print(nodes[i].heaterEnabled ? "true" : "false");
+        Serial.print(",\"sample_rate_hz\":"); Serial.print(nodes[i].sampleRateHz);
         Serial.print(",\"next_poll_in_ms\":"); Serial.print(static_cast<int32_t>(nodes[i].nextPollDueAtMs - millis()));
         Serial.print("}");
     }
@@ -746,7 +820,7 @@ void processSerialCommand(const String& raw) {
     cmd.trim();
     promptShown = false;
     if (cmd.equalsIgnoreCase("HELP")) {
-        Serial.println("Commands: HELP, NODES, BIND, BIND OFF, SETINT <nodeId> <ms>, SETTOFF <nodeId> <tempOffsetC>, STREAM OFF, STREAM ON, TIME STATUS, TIME SET <unixSeconds>, OTA BEGIN <nodeId> <size> <crc32hex>, OTA CHUNK <offset> <hex>, OTA END, OTA STATUS, OTA ABORT");
+        Serial.println("Commands: HELP, NODES, BIND, BIND OFF, SETINT <nodeId> <ms>, SETINT ALL <ms>, SETSAMPLE <nodeId> <hz>, SETSAMPLE ALL <hz>, SETTOFF <nodeId> <tempOffsetC>, HEATER <nodeId> ON|OFF, RENAME <nodeId> <name>, STREAM OFF, STREAM ON, TIME STATUS, TIME SET <unixSeconds>, OTA BEGIN <nodeId> <size> <crc32hex>, OTA CHUNK <offset> <hex>, OTA END, OTA STATUS, OTA ABORT");
     } else if (cmd.equalsIgnoreCase("NODES")) {
         listNodes();
     } else if (cmd.equalsIgnoreCase("BIND")) {
@@ -787,12 +861,56 @@ void processSerialCommand(const String& raw) {
             );
         }
     } else if (cmd.startsWith("SETINT ")) {
-        int sp = cmd.indexOf(' ', 7);
-        if (sp > 0) {
-            uint32_t nodeId = cmd.substring(7, sp).toInt();
-            uint32_t ms = cmd.substring(sp + 1).toInt();
-            int idx = findNodeById(nodeId);
-            if (idx >= 0) sendConfig(nodeId, ms, nodes[idx].tempOffsetC);
+        if (cmd.startsWith("SETINT ALL ")) {
+            uint32_t ms = cmd.substring(11).toInt();
+            uint32_t appliedCount = 0;
+            for (size_t i = 0; i < MAX_NODES; ++i) {
+                if (!nodes[i].used) continue;
+                sendConfig(nodes[i].nodeId, ms, nodes[i].tempOffsetC, nodes[i].heaterEnabled, nodes[i].sampleRateHz);
+                appliedCount++;
+            }
+            printJsonEvent(
+                "{\"event\":\"setint_all\",\"report_interval_ms\":" + String(ms) +
+                ",\"targets\":" + String(appliedCount) + "}",
+                true
+            );
+        } else {
+            int sp = cmd.indexOf(' ', 7);
+            if (sp > 0) {
+                uint32_t nodeId = cmd.substring(7, sp).toInt();
+                uint32_t ms = cmd.substring(sp + 1).toInt();
+                int idx = findNodeById(nodeId);
+                if (idx >= 0) sendConfig(nodeId, ms, nodes[idx].tempOffsetC, nodes[idx].heaterEnabled, nodes[idx].sampleRateHz);
+            }
+        }
+    } else if (cmd.startsWith("SETSAMPLE ")) {
+        if (cmd.startsWith("SETSAMPLE ALL ")) {
+            uint16_t hz = normalizeSampleRateHz(cmd.substring(14).toInt());
+            uint32_t appliedCount = 0;
+            for (size_t i = 0; i < MAX_NODES; ++i) {
+                if (!nodes[i].used) continue;
+                nodes[i].sampleRateHz = hz;
+                saveNode(i);
+                sendConfig(nodes[i].nodeId, nodes[i].reportIntervalMs, nodes[i].tempOffsetC, nodes[i].heaterEnabled, nodes[i].sampleRateHz);
+                appliedCount++;
+            }
+            printJsonEvent(
+                "{\"event\":\"setsample_all\",\"sample_rate_hz\":" + String(hz) +
+                ",\"targets\":" + String(appliedCount) + "}",
+                true
+            );
+        } else {
+            int sp = cmd.indexOf(' ', 10);
+            if (sp > 0) {
+                uint32_t nodeId = cmd.substring(10, sp).toInt();
+                uint16_t hz = normalizeSampleRateHz(cmd.substring(sp + 1).toInt());
+                int idx = findNodeById(nodeId);
+                if (idx >= 0) {
+                    nodes[idx].sampleRateHz = hz;
+                    saveNode(static_cast<size_t>(idx));
+                    sendConfig(nodeId, nodes[idx].reportIntervalMs, nodes[idx].tempOffsetC, nodes[idx].heaterEnabled, nodes[idx].sampleRateHz);
+                }
+            }
         }
     } else if (cmd.startsWith("SETTOFF ")) {
         int sp = cmd.indexOf(' ', 8);
@@ -803,7 +921,43 @@ void processSerialCommand(const String& raw) {
             if (idx >= 0) {
                 nodes[idx].tempOffsetC = offsetC;
                 saveNode(static_cast<size_t>(idx));
-                sendConfig(nodeId, nodes[idx].reportIntervalMs, nodes[idx].tempOffsetC);
+                sendConfig(nodeId, nodes[idx].reportIntervalMs, nodes[idx].tempOffsetC, nodes[idx].heaterEnabled, nodes[idx].sampleRateHz);
+            }
+        }
+    } else if (cmd.startsWith("HEATER ")) {
+        int sp = cmd.indexOf(' ', 7);
+        if (sp > 0) {
+            uint32_t nodeId = cmd.substring(7, sp).toInt();
+            String value = cmd.substring(sp + 1);
+            value.trim();
+            int idx = findNodeById(nodeId);
+            if (idx >= 0) {
+                if (value.equalsIgnoreCase("ON")) {
+                    nodes[idx].heaterEnabled = true;
+                } else if (value.equalsIgnoreCase("OFF")) {
+                    nodes[idx].heaterEnabled = false;
+                } else {
+                    printJsonEvent("{\"event\":\"heater_error\",\"reason\":\"invalid_value\"}", true);
+                    printPrompt();
+                    return;
+                }
+                saveNode(static_cast<size_t>(idx));
+                sendConfig(nodeId, nodes[idx].reportIntervalMs, nodes[idx].tempOffsetC, nodes[idx].heaterEnabled, nodes[idx].sampleRateHz);
+            }
+        }
+    } else if (cmd.startsWith("RENAME ")) {
+        int sp = cmd.indexOf(' ', 7);
+        if (sp > 0) {
+            uint32_t nodeId = cmd.substring(7, sp).toInt();
+            const String name = sanitizeNodeName(cmd.substring(sp + 1));
+            int idx = findNodeById(nodeId);
+            if (idx >= 0) {
+                sendRename(nodeId, name);
+                printJsonEvent(
+                    "{\"event\":\"rename_sent\",\"node_id\":" + String(nodeId) +
+                    ",\"name\":\"" + name + "\"}",
+                    true
+                );
             }
         }
     } else if (cmd.equalsIgnoreCase("OTA STATUS")) {
@@ -850,11 +1004,13 @@ void processSerialCommand(const String& raw) {
             printJsonEvent("{\"event\":\"ota_error\",\"reason\":\"end_rejected\"}");
         }
     }
-    printPrompt();
+    if (!cmd.startsWith("OTA CHUNK ")) {
+        printPrompt();
+    }
 }
 
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(SERIAL_BAUD);
     delay(500);
     initStatusLed();
 
@@ -894,7 +1050,6 @@ void loop() {
         char c = static_cast<char>(Serial.read());
         if (c == '\n' || c == '\r') {
             if (!line.isEmpty()) {
-                Serial.println();
                 processSerialCommand(line);
             } else if (!promptShown) {
                 printPrompt();
@@ -903,11 +1058,9 @@ void loop() {
         } else if (c == '\b' || c == 127) {
             if (!line.isEmpty()) {
                 line.remove(line.length() - 1);
-                Serial.print("\b \b");
             }
         } else {
             line += c;
-            Serial.print(c);
         }
     }
 

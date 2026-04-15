@@ -4,11 +4,13 @@
 
 namespace proto {
 
-static constexpr uint16_t PROTOCOL_VERSION = 3;
+static constexpr uint16_t PROTOCOL_VERSION = 4;
 static constexpr uint8_t  RADIO_CHANNEL     = 6;   // must match on all nodes
 static constexpr uint32_t DEFAULT_REPORT_MS = 1000;
 static constexpr uint32_t MIN_REPORT_MS     = 500;
-static constexpr uint32_t HEARTBEAT_MS      = 30000;
+static constexpr uint16_t DEFAULT_SAMPLE_RATE_HZ = 100;
+static constexpr uint16_t MIN_SAMPLE_RATE_HZ     = 1;
+static constexpr uint16_t MAX_SAMPLE_RATE_HZ     = 200;
 static constexpr uint32_t BIND_WINDOW_MS    = 120000;
 static constexpr char MAGIC[4]              = {'T', 'M', 'O', 'N'};
 
@@ -16,7 +18,6 @@ enum MessageType : uint8_t {
     MSG_BIND_REQUEST = 1,
     MSG_BIND_ACK     = 2,
     MSG_READING      = 3,
-    MSG_HEARTBEAT    = 4,
     MSG_CONFIG_SET   = 5,
     MSG_CONFIG_ACK   = 6,
     MSG_SAMPLE_REQ   = 7,
@@ -26,6 +27,8 @@ enum MessageType : uint8_t {
     MSG_OTA_CHUNK    = 11,
     MSG_OTA_END      = 12,
     MSG_OTA_ACK      = 13,
+    MSG_RENAME_SET   = 14,
+    MSG_RENAME_ACK   = 15,
 };
 
 enum OtaPhase : uint8_t {
@@ -72,7 +75,8 @@ struct __attribute__((packed)) BindAck {
     float tempOffsetC;
     uint8_t controllerMac[6];
     uint8_t accepted;
-    uint8_t reserved[3];
+    uint8_t heaterEnabled;
+    uint16_t sampleRateHz;
 };
 
 struct __attribute__((packed)) Reading {
@@ -85,17 +89,13 @@ struct __attribute__((packed)) Reading {
     uint8_t reserved[2];   // reserved[0]=fwMajor, reserved[1]=fwMinor
 };
 
-struct __attribute__((packed)) Heartbeat {
-    Header header;
-    uint8_t sensorOk;
-    uint8_t wifiChannel;
-    uint16_t reserved;     // low byte=fwMajor, high byte=fwMinor
-};
-
 struct __attribute__((packed)) ConfigSet {
     Header header;
     uint32_t reportIntervalMs;
     float tempOffsetC;
+    uint8_t heaterEnabled;
+    uint16_t sampleRateHz;
+    uint8_t reserved;
 };
 
 struct __attribute__((packed)) ConfigAck {
@@ -103,7 +103,8 @@ struct __attribute__((packed)) ConfigAck {
     uint32_t reportIntervalMs;
     float tempOffsetC;
     uint8_t applied;
-    uint8_t reserved[3];
+    uint8_t heaterEnabled;
+    uint16_t sampleRateHz;
 };
 
 struct __attribute__((packed)) SampleRequest {
@@ -136,6 +137,18 @@ struct __attribute__((packed)) OtaAck {
     uint8_t status;
     uint16_t detail;
     uint32_t bytesReceived;
+};
+
+struct __attribute__((packed)) RenameSet {
+    Header header;
+    char nodeName[16];
+};
+
+struct __attribute__((packed)) RenameAck {
+    Header header;
+    uint8_t applied;
+    uint8_t reserved[3];
+    char nodeName[16];
 };
 
 inline void fillHeader(Header& h, MessageType type, uint32_t sequence, uint32_t nodeId, uint32_t uptimeMs) {
