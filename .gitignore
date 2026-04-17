@@ -1,0 +1,11 @@
+.venv/
+venv/
+.pio/
+__pycache__/
+*.py[cod]
+
+# JetBrains local workspace state; keep shared project files under .idea tracked.
+.idea/workspace.xml
+
+# Local agent handoff/context files.
+.ai/

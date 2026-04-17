@@ -27,52 +27,61 @@ from matplotlib.ticker import AutoMinorLocator, MultipleLocator, NullLocator
 
 
 class ArduinoLoggerApp:
-    ARDUINO_CHANNEL_COUNT = 8
+    ARDUINO_CHANNEL_COUNT = 6
     ESP_CHANNEL_COUNT = 8
     CHANNEL_COUNT = ARDUINO_CHANNEL_COUNT + ESP_CHANNEL_COUNT
     DEFAULT_INTERVAL_TEXT = "1s"
     SMOOTHING_WINDOW = 5
-    HANDSHAKE_MARKER = "STH85"
     ARDUINO_BAUD_RATE = 9600
     ESP_BAUD_RATE = 460800
     DB_FILE_NAME = "logger.db"
-    DATA_FILE_NAME = "data.csv"
+    TEMP_DATA_FILE_NAME = "data_temperature.csv"
+    HUM_DATA_FILE_NAME = "data_humidity.csv"
     CONFIG_FILE_NAME = "config.ini"
+    SATELLITE_NAME_MAX_LEN = 15
     PLOT_HISTORY_SECONDS = 7 * 24 * 60 * 60
     MAX_RENDER_POINTS = 2500
-    PACKET_REGEX = re.compile(
-        r"CH\s*(\d+)\s*,\s*Temp\s*,\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*,\s*C\s*,\s*RH\s*,\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*,\s*%",
-        re.IGNORECASE
-    )
     DEFAULT_COLORS = [
         "red", "blue", "green", "orange", "purple", "brown", "magenta", "teal",
         "#e74c3c", "#3498db", "#2ecc71", "#f1c40f", "#8e44ad", "#16a085", "#d35400", "#7f8c8d"
     ]
     ZOOM_FACTOR = 0.70
+    DEFAULT_GRAPH_SPLIT_RATIO = 0.75
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Temperature and Humidity Logger - Arduino + ESP")
-        self.root.geometry("1000x800")
+        self.root.title("Temperature and Humidity Logger")
+        self.root.geometry("1024x680")
 
         if getattr(sys, "frozen", False):
             self.base_dir = os.path.abspath(os.path.dirname(sys.executable))
         else:
             self.base_dir = os.path.abspath(os.path.dirname(__file__))
         self.resource_dir = getattr(sys, "_MEIPASS", self.base_dir)
-        self.data_csv_path = os.path.join(self.base_dir, self.DATA_FILE_NAME)
         self.config_path = os.path.join(self.base_dir, self.CONFIG_FILE_NAME)
-        self.data_csv_initialized = False
+        self.runtime_settings = self.runtime_settings_defaults()
+        self.load_runtime_settings()
+        self.temp_data_csv_path = os.path.join(self.base_dir, self.TEMP_DATA_FILE_NAME)
+        self.hum_data_csv_path = os.path.join(self.base_dir, self.HUM_DATA_FILE_NAME)
+        self.temp_data_csv_initialized = False
+        self.hum_data_csv_initialized = False
         self.saved_interval_text = self.DEFAULT_INTERVAL_TEXT
         self.saved_arduino_port = ""
         self.saved_esp_port = ""
         self.saved_column_widths = {}
         self.saved_live_split_x = None
+        self.saved_graph_split_x = None
+        self.saved_graph_split_ratio = self.DEFAULT_GRAPH_SPLIT_RATIO
         self.minor_grid_enabled = True
+        self.markers_visible = True
+        self.markers_floating = False
         self.terminal_mode = "docked"
         self.terminal_visible = True
         self.terminal_window = None
         self.floating_console_text = None
+        self.markers_window = None
+        self.floating_markers_listbox = None
+        self.floating_markers_scrollbar = None
 
         self.serial_ports = {"arduino": None, "esp": None}
         self.source_connected = {"arduino": False, "esp": False}
@@ -82,17 +91,24 @@ class ArduinoLoggerApp:
 
         self.receive_buffers = {"arduino": "", "esp": ""}
         self.arduino_polling_started = False
+        self.arduino_info = {"board": "", "fw_version": "", "protocol": "", "channel_count": None}
         self.esp_slot_by_node_id = {}
+        self.esp_node_state = {}
         self.esp_init_job = None
         self.esp_init_attempts_remaining = 0
         self.esp_stream_confirmed = False
+        self.esp_time_synced = False
+        self.esp_presence_job = None
 
         self.current_temps = ["NaN"] * self.CHANNEL_COUNT
         self.current_hums = ["NaN"] * self.CHANNEL_COUNT
+        self.current_signals = ["-"] * self.CHANNEL_COUNT
         self.temp_history = [deque(maxlen=self.SMOOTHING_WINDOW) for _ in range(self.CHANNEL_COUNT)]
+        self.hum_history = [deque(maxlen=self.SMOOTHING_WINDOW) for _ in range(self.CHANNEL_COUNT)]
 
         self.series_times = [deque(maxlen=self.PLOT_HISTORY_SECONDS) for _ in range(self.CHANNEL_COUNT)]
-        self.series_values = [deque(maxlen=self.PLOT_HISTORY_SECONDS) for _ in range(self.CHANNEL_COUNT)]
+        self.temp_series_values = [deque(maxlen=self.PLOT_HISTORY_SECONDS) for _ in range(self.CHANNEL_COUNT)]
+        self.hum_series_values = [deque(maxlen=self.PLOT_HISTORY_SECONDS) for _ in range(self.CHANNEL_COUNT)]
         self.last_plot_second = [None] * self.CHANNEL_COUNT
 
         # Graph redraw state
@@ -117,6 +133,9 @@ class ArduinoLoggerApp:
         self._drag_ylim = None       # ylim snapshot at press
         self._drag_inv_tf = None     # inverse data transform snapshot at press
         self._is_dragging = False
+        self._drag_graph_kind = None
+        self.graph_contexts = {}
+        self.active_graph_kind = "temp"
 
         # SQLite state
         self.db_conn = None
@@ -136,6 +155,7 @@ class ArduinoLoggerApp:
         self.build_ui()
         self.refresh_ports()
         self.process_ui_queue()
+        self.schedule_esp_presence_check()
 
     def default_channel_name(self, ch_idx):
         if ch_idx < self.ARDUINO_CHANNEL_COUNT:
@@ -156,18 +176,109 @@ class ArduinoLoggerApp:
                 return node_id
         return None
 
+    def sanitize_satellite_name(self, raw_name):
+        sanitized = []
+        for ch in str(raw_name or "").strip():
+            if len(sanitized) >= self.SATELLITE_NAME_MAX_LEN:
+                break
+            if ch.isascii() and (ch.isalnum() or ch in "_- "):
+                sanitized.append(ch)
+        safe_name = "".join(sanitized).strip()
+        return safe_name or "satellite"
+
+    def satellite_display_name(self, node_id):
+        state = self.esp_node_state.get(node_id) or {}
+        slot_idx = state.get("slot_idx")
+        try:
+            slot_idx = int(slot_idx)
+        except Exception:
+            slot_idx = None
+        if slot_idx is not None and 0 <= slot_idx < self.CHANNEL_COUNT:
+            name = str(self.channel_names[slot_idx] or "").strip()
+            if name:
+                return name
+        name = str(state.get("name") or "satellite").strip()
+        return name or "satellite"
+
+    def satellite_editor_initial_name(self, ch_idx):
+        current_name = str(self.channel_names[ch_idx] or "").strip()
+        node_id = self.find_esp_node_id_by_slot(ch_idx)
+        if node_id is None:
+            return current_name
+        state = self.esp_node_state.get(node_id) or {}
+        remote_name = str(state.get("name") or "").strip()
+        auto_prefix = "ESP Node {0} - ".format(node_id)
+        if current_name.startswith(auto_prefix) and remote_name:
+            return remote_name
+        return current_name
+
+    def apply_channel_editor_changes(self, ch_idx, new_name, new_color, record_enabled):
+        display_name = str(new_name or "").strip() or self.default_channel_name(ch_idx)
+        self.channel_names[ch_idx] = display_name
+        self.channel_colors[ch_idx] = new_color
+        self.set_channel_recording(ch_idx, bool(record_enabled))
+        tag = "ch_color_{0}".format(ch_idx)
+        self.tree.tag_configure(tag, foreground=new_color)
+        self.update_channel_tree_row(ch_idx)
+        node_id = self.find_esp_node_id_by_slot(ch_idx)
+        if node_id is not None:
+            state = self.esp_node_state.setdefault(node_id, {})
+            state["slot_idx"] = ch_idx
+        for ctx in self.graph_contexts.values():
+            ctx["lines"][ch_idx].set_label(display_name)
+            ctx["lines"][ch_idx].set_color(new_color)
+        self.refresh_legend()
+        for ctx in self.graph_contexts.values():
+            ctx["canvas"].draw_idle()
+        return display_name
+
+    def send_satellite_rename(self, ch_idx, requested_name, parent=None):
+        node_id = self.find_esp_node_id_by_slot(ch_idx)
+        if node_id is None:
+            messagebox.showwarning(
+                "Send to Satellite",
+                "This channel is not currently mapped to a connected satellite.",
+                parent=parent,
+            )
+            return False, None
+        if not self.source_connected["esp"]:
+            messagebox.showwarning(
+                "Send to Satellite",
+                "ESP controller is not connected.",
+                parent=parent,
+            )
+            return False, None
+        safe_name = self.sanitize_satellite_name(requested_name)
+        if self.send_esp_command("RENAME {0} {1}".format(node_id, safe_name)):
+            self.append_console(">>> [ESP] RENAME {0} {1}".format(node_id, safe_name))
+            return True, safe_name
+        messagebox.showwarning(
+            "Send to Satellite",
+            "Failed to send rename command to the ESP controller.",
+            parent=parent,
+        )
+        return False, None
+
     def channel_has_data(self, ch_idx):
         if self.current_temps[ch_idx] not in ("NaN", "", None):
             return True
         if self.current_hums[ch_idx] not in ("NaN", "", None):
             return True
-        if self.series_times[ch_idx] or self.series_values[ch_idx]:
+        if (
+            self.series_times[ch_idx]
+            or self.temp_series_values[ch_idx]
+            or self.hum_series_values[ch_idx]
+        ):
             return True
         return False
 
     def channel_is_visible_in_ui(self, ch_idx):
+        if self.loaded_session_id is not None and not self.any_source_connected():
+            return self.channel_has_data(ch_idx)
         if ch_idx < self.ARDUINO_CHANNEL_COUNT:
-            return True
+            return self.source_connected["arduino"]
+        if not self.source_connected["esp"]:
+            return False
         return self.find_esp_node_id_by_slot(ch_idx) is not None or self.channel_has_data(ch_idx)
 
     def visible_channel_indices(self):
@@ -176,6 +287,7 @@ class ArduinoLoggerApp:
     def channel_row_values(self, ch_idx):
         temp_display = "-"
         hum_display = "-"
+        signal_display = self.current_signals[ch_idx] if self.current_signals[ch_idx] not in ("", None) else "-"
         if self.current_temps[ch_idx] not in ("NaN", "", None):
             temp_display = "{0} \u00b0C".format(self.current_temps[ch_idx])
         if self.current_hums[ch_idx] not in ("NaN", "", None):
@@ -186,6 +298,7 @@ class ArduinoLoggerApp:
             self.channel_tree_name(ch_idx),
             temp_display,
             hum_display,
+            signal_display,
         )
 
     def rebuild_channel_tree(self):
@@ -209,6 +322,7 @@ class ArduinoLoggerApp:
         for slot_idx in range(self.ARDUINO_CHANNEL_COUNT, self.CHANNEL_COUNT):
             if self.find_esp_node_id_by_slot(slot_idx) is None:
                 self.esp_slot_by_node_id[node_id] = slot_idx
+                self.current_signals[slot_idx] = "-"
                 self.rebuild_channel_tree()
                 return slot_idx
         self.append_console("ESP slot limit reached, dropping node {0}".format(node_id))
@@ -216,6 +330,13 @@ class ArduinoLoggerApp:
 
     def any_source_connected(self):
         return any(self.source_connected.values())
+
+    @staticmethod
+    def format_board_name(board_name):
+        raw = str(board_name or "").strip()
+        if not raw:
+            return "Arduino"
+        return raw.replace("_", " ").title()
 
     def update_status_label(self):
         states = []
@@ -228,12 +349,293 @@ class ArduinoLoggerApp:
             states.append("ESP streaming")
         self.lbl_status.config(text=" | ".join(states) if states else "Disconnected")
 
+    def format_signal_display(self, signal_pct=None, rssi_dbm=None):
+        pct_text = ""
+        dbm_text = ""
+        try:
+            if signal_pct is not None:
+                pct_text = "{0}%".format(int(round(float(signal_pct))))
+        except Exception:
+            pct_text = ""
+        try:
+            if rssi_dbm is not None:
+                dbm_text = "{0} dBm".format(int(round(float(rssi_dbm))))
+        except Exception:
+            dbm_text = ""
+        if pct_text and dbm_text:
+            return "{0} ({1})".format(pct_text, dbm_text)
+        return pct_text or dbm_text or "-"
+
+    def channel_legend_label(self, ch_idx):
+        return self.channel_legend_label_for_kind(self.active_graph_kind, ch_idx)
+
+    def channel_legend_label_for_kind(self, kind, ch_idx):
+        return self.expanded_channel_legend_label_for_kind(kind, ch_idx)
+
+    def compact_channel_legend_label_for_kind(self, kind, ch_idx):
+        parts = [self.channel_display_id(ch_idx)]
+        if kind == "temp":
+            if self.current_temps[ch_idx] not in ("NaN", "", None):
+                parts.append("{0}\u00b0C".format(self.current_temps[ch_idx]))
+        else:
+            if self.current_hums[ch_idx] not in ("NaN", "", None):
+                parts.append("{0}%".format(self.current_hums[ch_idx]))
+        return " ".join(parts)
+
+    def expanded_channel_legend_label_for_kind(self, kind, ch_idx):
+        parts = [self.channel_names[ch_idx]]
+        if kind == "temp":
+            if self.current_temps[ch_idx] not in ("NaN", "", None):
+                parts.append("{0} \u00b0C".format(self.current_temps[ch_idx]))
+        else:
+            if self.current_hums[ch_idx] not in ("NaN", "", None):
+                parts.append("{0} %".format(self.current_hums[ch_idx]))
+        return " | ".join(parts)
+
+    def series_values_for_kind(self, kind):
+        return self.temp_series_values if kind == "temp" else self.hum_series_values
+
+    def graph_title_text(self, kind):
+        return "Temperature" if kind == "temp" else "Humidity"
+
+    def graph_y_label(self, kind):
+        if kind == "temp":
+            return "Temperature (\u00b0C)"
+        return "Humidity (%)"
+
+    def graph_tab_for_kind(self, kind):
+        return self.tab_graph if kind == "temp" else self.tab_humidity_graph
+
+    def set_active_graph(self, kind, select_tab=False):
+        ctx = self.graph_contexts.get(kind)
+        if ctx is None:
+            return
+        self.active_graph_kind = kind
+        self.figure = ctx["figure"]
+        self.ax = ctx["ax"]
+        self.canvas = ctx["canvas"]
+        self.toolbar = ctx["toolbar"]
+        self.h_scroll = ctx["h_scroll"]
+        self.lines = ctx["lines"]
+        self.graph_split = ctx["graph_split"]
+        self.markers_panel = ctx["markers_panel"]
+        self.markers_listbox = ctx["markers_listbox"]
+        if select_tab and hasattr(self, "notebook"):
+            self.notebook.select(self.graph_tab_for_kind(kind))
+
+    def refresh_graph_titles(self):
+        session_title = ""
+        if self.loaded_session_id is not None:
+            session_title = self.get_session_name(self.loaded_session_id)
+        elif self.db_session_id is not None:
+            session_title = ""
+        for kind, ctx in self.graph_contexts.items():
+            ctx["ax"].set_title(self.graph_title_text(kind))
+            ctx["ax"].set_title(session_title, loc="left")
+
+    def add_auto_marker(self, note, dt=None):
+        marker_dt = dt if dt is not None else datetime.now()
+        self._place_marker(marker_dt, note, save_to_db=True)
+        self.append_console("[MARKER] {0}".format(note))
+
+    def update_esp_node_presence(self, node_id, online, dt=None):
+        state = self.esp_node_state.setdefault(
+            node_id,
+            {
+                "slot_idx": None,
+                "name": "satellite",
+                "online": False,
+                "last_seen_monotonic": 0.0,
+                "last_seen_dt": None,
+                "report_interval_ms": 1000,
+                "signal_pct": None,
+                "rssi_dbm": None,
+                "has_announced_online": False,
+            }
+        )
+        prev_online = bool(state.get("online"))
+        if online:
+            state["online"] = True
+            state["last_seen_dt"] = dt if dt is not None else datetime.now()
+            slot_idx = state.get("slot_idx")
+            if slot_idx is not None and 0 <= int(slot_idx) < self.CHANNEL_COUNT:
+                self.update_channel_tree_row(int(slot_idx), signal_display=self.current_signals[int(slot_idx)])
+                self.refresh_legend()
+            if prev_online:
+                return
+            if state.get("has_announced_online"):
+                name = self.satellite_display_name(node_id)
+                self.add_auto_marker(
+                    "Satellite {0} ({1}) back online".format(node_id, name),
+                    dt=state["last_seen_dt"]
+                )
+            state["has_announced_online"] = True
+            return
+
+        if not prev_online:
+            return
+        state["online"] = False
+        slot_idx = state.get("slot_idx")
+        if slot_idx is not None and 0 <= int(slot_idx) < self.CHANNEL_COUNT:
+            self.current_signals[int(slot_idx)] = "offline"
+            self.update_channel_tree_row(int(slot_idx), signal_display="offline")
+            self.refresh_legend()
+        name = self.satellite_display_name(node_id)
+        self.add_auto_marker(
+            "Satellite {0} ({1}) lost connection".format(node_id, name),
+            dt=dt if dt is not None else datetime.now()
+        )
+
+    def schedule_esp_presence_check(self):
+        if self.esp_presence_job is not None:
+            try:
+                self.root.after_cancel(self.esp_presence_job)
+            except Exception:
+                pass
+        self.esp_presence_job = self.root.after(1000, self.check_esp_presence)
+
+    def check_esp_presence(self):
+        self.esp_presence_job = None
+        now_monotonic = time.monotonic()
+        now_dt = datetime.now()
+        if self.source_connected["esp"]:
+            for node_id, state in list(self.esp_node_state.items()):
+                if not state.get("online"):
+                    continue
+                report_interval_ms = state.get("report_interval_ms") or 1000
+                try:
+                    report_interval_ms = max(250, int(report_interval_ms))
+                except Exception:
+                    report_interval_ms = 1000
+                stale_after_s = max(5.0, (report_interval_ms * 3) / 1000.0)
+                last_seen = float(state.get("last_seen_monotonic") or 0.0)
+                if last_seen > 0.0 and (now_monotonic - last_seen) > stale_after_s:
+                    self.update_esp_node_presence(node_id, False, dt=now_dt)
+        self.schedule_esp_presence_check()
+
     @classmethod
     def reading_column_names(cls):
         cols = []
         for i in range(cls.CHANNEL_COUNT):
             cols.extend(["ch{0}_temp".format(i), "ch{0}_hum".format(i)])
         return cols
+
+    @classmethod
+    def runtime_settings_defaults(cls):
+        return {
+            "arduino_channel_count": cls.ARDUINO_CHANNEL_COUNT,
+            "esp_channel_count": cls.ESP_CHANNEL_COUNT,
+            "default_interval_text": cls.DEFAULT_INTERVAL_TEXT,
+            "smoothing_window": cls.SMOOTHING_WINDOW,
+            "arduino_baud_rate": cls.ARDUINO_BAUD_RATE,
+            "esp_baud_rate": cls.ESP_BAUD_RATE,
+            "db_file_name": cls.DB_FILE_NAME,
+            "temp_data_file_name": cls.TEMP_DATA_FILE_NAME,
+            "hum_data_file_name": cls.HUM_DATA_FILE_NAME,
+            "plot_history_seconds": cls.PLOT_HISTORY_SECONDS,
+            "max_render_points": cls.MAX_RENDER_POINTS,
+            "zoom_factor": cls.ZOOM_FACTOR,
+            "default_graph_split_ratio": cls.DEFAULT_GRAPH_SPLIT_RATIO,
+        }
+
+    @staticmethod
+    def _sanitize_runtime_filename(value, default_name, required_ext=None):
+        raw = os.path.basename(str(value or "").strip())
+        if not raw:
+            raw = default_name
+        if required_ext and not raw.lower().endswith(required_ext.lower()):
+            raw += required_ext
+        return raw
+
+    def sanitize_runtime_settings(self, settings):
+        defaults = self.runtime_settings_defaults()
+        clean = dict(defaults)
+
+        def _to_int(key, minimum, maximum=None):
+            try:
+                value = int(settings.get(key, defaults[key]))
+            except Exception:
+                value = defaults[key]
+            value = max(minimum, value)
+            if maximum is not None:
+                value = min(maximum, value)
+            clean[key] = value
+
+        def _to_float(key, minimum, maximum):
+            try:
+                value = float(settings.get(key, defaults[key]))
+            except Exception:
+                value = defaults[key]
+            value = max(minimum, min(maximum, value))
+            clean[key] = value
+
+        _to_int("arduino_channel_count", 1, 32)
+        _to_int("esp_channel_count", 0, 32)
+        interval_text = str(settings.get("default_interval_text", defaults["default_interval_text"]) or "").strip()
+        clean["default_interval_text"] = interval_text if self.parse_interval_ms(interval_text) is not None else defaults["default_interval_text"]
+        _to_int("smoothing_window", 1, 120)
+        _to_int("arduino_baud_rate", 300)
+        _to_int("esp_baud_rate", 300)
+        clean["db_file_name"] = self._sanitize_runtime_filename(
+            settings.get("db_file_name"), defaults["db_file_name"], required_ext=".db"
+        )
+        clean["temp_data_file_name"] = self._sanitize_runtime_filename(
+            settings.get("temp_data_file_name"), defaults["temp_data_file_name"], required_ext=".csv"
+        )
+        clean["hum_data_file_name"] = self._sanitize_runtime_filename(
+            settings.get("hum_data_file_name"), defaults["hum_data_file_name"], required_ext=".csv"
+        )
+        _to_int("plot_history_seconds", 60)
+        _to_int("max_render_points", 100)
+        _to_float("zoom_factor", 0.10, 0.95)
+        _to_float("default_graph_split_ratio", 0.50, 0.90)
+        return clean
+
+    def apply_startup_runtime_settings(self):
+        cls = self.__class__
+        settings = self.runtime_settings
+        cls.ARDUINO_CHANNEL_COUNT = int(settings["arduino_channel_count"])
+        cls.ESP_CHANNEL_COUNT = int(settings["esp_channel_count"])
+        cls.CHANNEL_COUNT = cls.ARDUINO_CHANNEL_COUNT + cls.ESP_CHANNEL_COUNT
+        cls.DEFAULT_INTERVAL_TEXT = str(settings["default_interval_text"])
+        cls.SMOOTHING_WINDOW = int(settings["smoothing_window"])
+        cls.ARDUINO_BAUD_RATE = int(settings["arduino_baud_rate"])
+        cls.ESP_BAUD_RATE = int(settings["esp_baud_rate"])
+        cls.DB_FILE_NAME = str(settings["db_file_name"])
+        cls.TEMP_DATA_FILE_NAME = str(settings["temp_data_file_name"])
+        cls.HUM_DATA_FILE_NAME = str(settings["hum_data_file_name"])
+        cls.PLOT_HISTORY_SECONDS = int(settings["plot_history_seconds"])
+        cls.MAX_RENDER_POINTS = int(settings["max_render_points"])
+        cls.ZOOM_FACTOR = float(settings["zoom_factor"])
+        cls.DEFAULT_GRAPH_SPLIT_RATIO = float(settings["default_graph_split_ratio"])
+
+    def apply_live_runtime_settings(self):
+        cls = self.__class__
+        settings = self.runtime_settings
+        cls.DEFAULT_INTERVAL_TEXT = str(settings["default_interval_text"])
+        cls.ARDUINO_BAUD_RATE = int(settings["arduino_baud_rate"])
+        cls.ESP_BAUD_RATE = int(settings["esp_baud_rate"])
+        cls.TEMP_DATA_FILE_NAME = str(settings["temp_data_file_name"])
+        cls.HUM_DATA_FILE_NAME = str(settings["hum_data_file_name"])
+        cls.MAX_RENDER_POINTS = int(settings["max_render_points"])
+        cls.ZOOM_FACTOR = float(settings["zoom_factor"])
+        cls.DEFAULT_GRAPH_SPLIT_RATIO = float(settings["default_graph_split_ratio"])
+        self.temp_data_csv_path = os.path.join(self.base_dir, self.TEMP_DATA_FILE_NAME)
+        self.hum_data_csv_path = os.path.join(self.base_dir, self.HUM_DATA_FILE_NAME)
+
+    def load_runtime_settings(self):
+        cfg = configparser.ConfigParser()
+        if os.path.exists(self.config_path):
+            try:
+                cfg.read(self.config_path, encoding="utf-8")
+            except Exception:
+                pass
+        settings = self.runtime_settings_defaults()
+        if cfg.has_section("runtime"):
+            for key in settings:
+                settings[key] = cfg.get("runtime", key, fallback=settings[key])
+        self.runtime_settings = self.sanitize_runtime_settings(settings)
+        self.apply_startup_runtime_settings()
 
     def apply_app_icon(self):
         def _apply_win_icons(ico_file):
@@ -381,6 +783,10 @@ class ArduinoLoggerApp:
             self.saved_esp_port = cfg.get("app", "last_esp_port", fallback="").strip()
             minor_grid_text = cfg.get("app", "minor_grid_enabled", fallback="1").strip().lower()
             self.minor_grid_enabled = minor_grid_text in ("1", "true", "yes", "on")
+            markers_visible_text = cfg.get("app", "markers_visible", fallback="1").strip().lower()
+            self.markers_visible = markers_visible_text in ("1", "true", "yes", "on")
+            markers_floating_text = cfg.get("app", "markers_floating", fallback="0").strip().lower()
+            self.markers_floating = markers_floating_text in ("1", "true", "yes", "on")
             terminal_mode = cfg.get("app", "terminal_mode", fallback="").strip().lower()
             terminal_visible_text = cfg.get("app", "terminal_visible", fallback="1").strip().lower()
             if terminal_mode in ("docked", "hidden", "floating"):
@@ -409,7 +815,7 @@ class ArduinoLoggerApp:
             )
 
         if cfg.has_section("columns"):
-            for col_id in ("rec", "id", "name", "temp", "hum"):
+            for col_id in ("rec", "id", "name", "temp", "hum", "signal"):
                 width_text = cfg.get("columns", col_id, fallback="").strip()
                 if not width_text:
                     continue
@@ -429,6 +835,22 @@ class ArduinoLoggerApp:
                     split_val = None
                 if split_val is not None and split_val > 100:
                     self.saved_live_split_x = split_val
+            graph_split_text = cfg.get("layout", "graph_split_x", fallback="").strip()
+            if graph_split_text:
+                try:
+                    graph_split_val = int(graph_split_text)
+                except ValueError:
+                    graph_split_val = None
+                if graph_split_val is not None and graph_split_val > 100:
+                    self.saved_graph_split_x = graph_split_val
+            graph_split_ratio_text = cfg.get("layout", "graph_split_ratio", fallback="").strip()
+            if graph_split_ratio_text:
+                try:
+                    graph_split_ratio = float(graph_split_ratio_text)
+                except ValueError:
+                    graph_split_ratio = None
+                if graph_split_ratio is not None and 0.50 <= graph_split_ratio <= 0.90:
+                    self.saved_graph_split_ratio = graph_split_ratio
 
     def save_config(self):
         def _dump_points(points):
@@ -443,8 +865,25 @@ class ArduinoLoggerApp:
             "last_arduino_port": self.cmb_arduino_port.get().strip(),
             "last_esp_port": self.cmb_esp_port.get().strip(),
             "minor_grid_enabled": "1" if self.minor_grid_enabled else "0",
+            "markers_visible": "1" if self.markers_visible else "0",
+            "markers_floating": "1" if self.markers_floating else "0",
             "terminal_mode": self.terminal_mode,
             "terminal_visible": "1" if self.terminal_visible else "0",
+        }
+        cfg["runtime"] = {
+            "arduino_channel_count": str(self.runtime_settings["arduino_channel_count"]),
+            "esp_channel_count": str(self.runtime_settings["esp_channel_count"]),
+            "default_interval_text": str(self.runtime_settings["default_interval_text"]),
+            "smoothing_window": str(self.runtime_settings["smoothing_window"]),
+            "arduino_baud_rate": str(self.runtime_settings["arduino_baud_rate"]),
+            "esp_baud_rate": str(self.runtime_settings["esp_baud_rate"]),
+            "db_file_name": str(self.runtime_settings["db_file_name"]),
+            "temp_data_file_name": str(self.runtime_settings["temp_data_file_name"]),
+            "hum_data_file_name": str(self.runtime_settings["hum_data_file_name"]),
+            "plot_history_seconds": str(self.runtime_settings["plot_history_seconds"]),
+            "max_render_points": str(self.runtime_settings["max_render_points"]),
+            "zoom_factor": "{0:.4f}".format(float(self.runtime_settings["zoom_factor"])),
+            "default_graph_split_ratio": "{0:.4f}".format(float(self.runtime_settings["default_graph_split_ratio"])),
         }
         if hasattr(self, "tree"):
             cfg["columns"] = {
@@ -453,6 +892,7 @@ class ArduinoLoggerApp:
                 "name": str(int(self.tree.column("name", "width"))),
                 "temp": str(int(self.tree.column("temp", "width"))),
                 "hum": str(int(self.tree.column("hum", "width"))),
+                "signal": str(int(self.tree.column("signal", "width"))),
             }
         if hasattr(self, "live_split"):
             try:
@@ -461,6 +901,16 @@ class ArduinoLoggerApp:
                 split_x = self.saved_live_split_x
             if split_x is not None:
                 cfg["layout"] = {"live_split_x": str(split_x)}
+        if hasattr(self, "graph_split"):
+            try:
+                graph_split_x = int(self.graph_split.sash_coord(0)[0])
+            except Exception:
+                graph_split_x = self.saved_graph_split_x
+            if graph_split_x is not None:
+                if "layout" not in cfg:
+                    cfg["layout"] = {}
+                cfg["layout"]["graph_split_x"] = str(graph_split_x)
+                cfg["layout"]["graph_split_ratio"] = "{0:.6f}".format(self.saved_graph_split_ratio)
         for i in range(self.CHANNEL_COUNT):
             section = "channel_{0}".format(i)
             cfg[section] = {
@@ -532,10 +982,11 @@ class ArduinoLoggerApp:
         except Exception as ex:
             self.append_console("Marker DB write error: {0}".format(ex))
 
-    def _csv_header(self):
+    def _csv_header(self, kind):
         header = ["Timestamp", "Marker", "Marker Text"]
+        suffix = "T" if kind == "temp" else "H"
         for i in range(self.CHANNEL_COUNT):
-            header.extend(["CH{0}_T".format(i), "CH{0}_H".format(i)])
+            header.append("CH{0}_{1}".format(i, suffix))
         return header
 
     def session_has_data(self, session_id):
@@ -547,7 +998,7 @@ class ArduinoLoggerApp:
         ).fetchone()
         return bool(row and row[0] > 0)
 
-    def iter_session_rows(self, session_id):
+    def iter_session_rows(self, session_id, kind):
         reading_columns_sql = ", ".join(self.reading_column_names())
         readings_cur = self.db_conn.execute(
             """SELECT timestamp, {0}
@@ -563,7 +1014,8 @@ class ArduinoLoggerApp:
 
         r = readings_cur.fetchone()
         m = markers_cur.fetchone()
-        empty_channels = tuple("" for _ in self.reading_column_names())
+        empty_channels = tuple("" for _ in range(self.CHANNEL_COUNT))
+        value_offset = 1 if kind == "hum" else 0
 
         while r is not None or m is not None:
             r_dt = self._parse_db_timestamp(r[0]) if r is not None else None
@@ -581,7 +1033,10 @@ class ArduinoLoggerApp:
                     use_reading = r_dt <= m_dt
 
             if use_reading:
-                yield (r[0], "", "") + tuple(r[1:])
+                values = []
+                for i in range(self.CHANNEL_COUNT):
+                    values.append(r[1 + 2 * i + value_offset])
+                yield (r[0], "", "") + tuple(values)
                 r = readings_cur.fetchone()
             else:
                 marker_ts = m[0].replace("T", " ")
@@ -612,35 +1067,49 @@ class ArduinoLoggerApp:
         session_name = self.get_session_name(session_id)
         safe_name = self._safe_filename_part(session_name)
         if safe_name:
-            filename = "log_{0}_{1}_{2}.csv".format(session_id, safe_name, ts)
+            base_name = "log_{0}_{1}_{2}".format(session_id, safe_name, ts)
         else:
-            filename = "log_{0}_{1}.csv".format(session_id, ts)
-        filepath = os.path.join(self.base_dir, filename)
+            base_name = "log_{0}_{1}".format(session_id, ts)
+        temp_filepath = os.path.join(self.base_dir, base_name + "_temperature.csv")
+        hum_filepath = os.path.join(self.base_dir, base_name + "_humidity.csv")
 
         if show_dialog:
             chosen = filedialog.asksaveasfilename(
                 title="Save Session CSV",
                 initialdir=self.base_dir,
-                initialfile=filename,
+                initialfile=base_name + "_temperature.csv",
                 defaultextension=".csv",
                 filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
             )
             if not chosen:
                 return
-            filepath = chosen
-            filename = os.path.basename(filepath)
+            chosen_base, chosen_ext = os.path.splitext(chosen)
+            if not chosen_ext:
+                chosen_ext = ".csv"
+            if chosen_base.endswith("_temperature"):
+                chosen_base = chosen_base[:-12]
+            elif chosen_base.endswith("_humidity"):
+                chosen_base = chosen_base[:-9]
+            temp_filepath = chosen_base + "_temperature" + chosen_ext
+            hum_filepath = chosen_base + "_humidity" + chosen_ext
 
         try:
-            with open(filepath, "w", newline="", encoding="utf-8") as f:
+            with open(temp_filepath, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                w.writerow(self._csv_header())
-                for row in self.iter_session_rows(session_id):
+                w.writerow(self._csv_header("temp"))
+                for row in self.iter_session_rows(session_id, "temp"):
+                    w.writerow(row)
+            with open(hum_filepath, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(self._csv_header("hum"))
+                for row in self.iter_session_rows(session_id, "hum"):
                     w.writerow(row)
 
-            self.append_console(">>> Exported to: {0}".format(filename))
+            self.append_console(">>> Exported to: {0}".format(os.path.basename(temp_filepath)))
+            self.append_console(">>> Exported to: {0}".format(os.path.basename(hum_filepath)))
             if show_dialog:
                 messagebox.showinfo("Export Complete",
-                                    "Session data saved to:\n{0}".format(filepath))
+                                    "Session data saved to:\n{0}\n{1}".format(temp_filepath, hum_filepath))
         except Exception as ex:
             self.append_console("Export error: {0}".format(ex))
             if show_dialog:
@@ -649,18 +1118,24 @@ class ArduinoLoggerApp:
     def append_session_to_data_csv(self, session_id):
         if not self.session_has_data(session_id):
             return
-        mode = "a" if self.data_csv_initialized else "w"
         try:
-            with open(self.data_csv_path, mode, newline="", encoding="utf-8") as f:
+            temp_filepath = os.path.join(self.base_dir, self.session_output_filename(session_id, "temp"))
+            hum_filepath = os.path.join(self.base_dir, self.session_output_filename(session_id, "hum"))
+
+            with open(temp_filepath, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
-                if not self.data_csv_initialized:
-                    w.writerow(self._csv_header())
-                for row in self.iter_session_rows(session_id):
+                w.writerow(self._csv_header("temp"))
+                for row in self.iter_session_rows(session_id, "temp"):
                     w.writerow(row)
-            self.data_csv_initialized = True
-            self.append_console(">>> Saved to: {0}".format(self.DATA_FILE_NAME))
+            with open(hum_filepath, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(self._csv_header("hum"))
+                for row in self.iter_session_rows(session_id, "hum"):
+                    w.writerow(row)
+            self.append_console(">>> Saved to: {0}".format(os.path.basename(temp_filepath)))
+            self.append_console(">>> Saved to: {0}".format(os.path.basename(hum_filepath)))
         except Exception as ex:
-            self.append_console("data.csv write error: {0}".format(ex))
+            self.append_console("CSV write error: {0}".format(ex))
 
     def get_sessions(self):
         return self.db_conn.execute(
@@ -677,6 +1152,35 @@ class ArduinoLoggerApp:
     def get_session_name(self, session_id):
         row = self.db_conn.execute("SELECT COALESCE(name, '') FROM sessions WHERE id = ?", (session_id,)).fetchone()
         return (row[0] if row else "").strip()
+
+    def get_session_time_range(self, session_id):
+        row = self.db_conn.execute(
+            "SELECT started_at, COALESCE(ended_at, '') FROM sessions WHERE id = ?",
+            (session_id,)
+        ).fetchone()
+        if row is None:
+            return None, None
+        started_at = self._parse_db_timestamp(row[0]) if row[0] else None
+        ended_at = self._parse_db_timestamp(row[1]) if row[1] else None
+        return started_at, ended_at
+
+    def _format_filename_datetime(self, dt):
+        if dt is None:
+            return "unknown"
+        return dt.strftime("%Y-%m-%d_%H-%M-%S")
+
+    def session_output_filename(self, session_id, kind):
+        started_at, ended_at = self.get_session_time_range(session_id)
+        configured_name = self.TEMP_DATA_FILE_NAME if kind == "temp" else self.HUM_DATA_FILE_NAME
+        stem, ext = os.path.splitext(configured_name)
+        safe_stem = self._safe_filename_part(stem) or ("data_temperature" if kind == "temp" else "data_humidity")
+        ext = ext or ".csv"
+        return "{0}_{1}_to_{2}{3}".format(
+            safe_stem,
+            self._format_filename_datetime(started_at),
+            self._format_filename_datetime(ended_at),
+            ext
+        )
 
     def _safe_filename_part(self, text):
         cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (text or "").strip())
@@ -744,6 +1248,7 @@ class ArduinoLoggerApp:
         settings_menu = tk.Menu(self.btn_settings, tearoff=0)
         self.btn_settings.config(menu=settings_menu)
         settings_menu.add_command(label="COM settings...", command=self.open_com_settings)
+        settings_menu.add_command(label="Application settings...", command=self.open_application_settings)
         settings_menu.add_command(label="Refresh COM ports", command=self.refresh_ports)
         settings_menu.add_separator()
         self.minor_grid_var = tk.BooleanVar(value=self.minor_grid_enabled)
@@ -757,6 +1262,12 @@ class ArduinoLoggerApp:
             label="Show terminal",
             variable=self.terminal_visible_var,
             command=self.on_terminal_visibility_toggle
+        )
+        self.markers_floating_var = tk.BooleanVar(value=self.markers_floating)
+        settings_menu.add_checkbutton(
+            label="Undock markers",
+            variable=self.markers_floating_var,
+            command=self.on_markers_floating_toggle
         )
         self.terminal_floating_var = tk.BooleanVar(value=self.terminal_mode == "floating")
         settings_menu.add_checkbutton(
@@ -779,9 +1290,11 @@ class ArduinoLoggerApp:
 
         tab_live = ttk.Frame(self.notebook)
         self.tab_graph = ttk.Frame(self.notebook)
+        self.tab_humidity_graph = ttk.Frame(self.notebook)
         self.tab_sessions = ttk.Frame(self.notebook)
         self.notebook.add(tab_live, text="Live View")
-        self.notebook.add(self.tab_graph, text="Graphics")
+        self.notebook.add(self.tab_graph, text="Temperature Graph")
+        self.notebook.add(self.tab_humidity_graph, text="Humidity Graph")
         self.notebook.add(self.tab_sessions, text="Sessions")
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
 
@@ -794,19 +1307,21 @@ class ArduinoLoggerApp:
         self.live_split.add(self.live_right, minsize=280)
         self.root.after(10, self._apply_initial_live_layout)
 
-        self.tree = ttk.Treeview(self.live_left, columns=("rec", "id", "name", "temp", "hum"), show="headings")
+        self.tree = ttk.Treeview(self.live_left, columns=("rec", "id", "name", "temp", "hum", "signal"), show="headings")
         self.tree.heading("rec", text="Active")
         self.tree.heading("id", text="ID")
         self.tree.heading("name", text="Name  (double-click to edit)")
         self.tree.heading("temp", text="Temp")
         self.tree.heading("hum", text="Hum")
+        self.tree.heading("signal", text="Signal")
         self.tree.column("rec", width=64, anchor="center")
         self.tree.column("id", width=60, anchor="center")
         self.tree.column("name", width=220, anchor="w")
         self.tree.column("temp", width=120, anchor="center")
         self.tree.column("hum", width=120, anchor="center")
+        self.tree.column("signal", width=120, anchor="center")
         for col_id, width_value in self.saved_column_widths.items():
-            if col_id in ("rec", "id", "name", "temp", "hum"):
+            if col_id in ("rec", "id", "name", "temp", "hum", "signal"):
                 self.tree.column(col_id, width=width_value)
         self.tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.tree.bind("<Button-1>", self.on_tree_click)
@@ -826,108 +1341,162 @@ class ArduinoLoggerApp:
         )
         self.txt_console.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
-    
-        # â”€â”€ Graphics Tab â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        content_frame = tk.Frame(self.tab_graph)
-        chart_frame = tk.Frame(content_frame)
+        self.build_graph_tab(self.tab_graph, "temp")
+        self.build_graph_tab(self.tab_humidity_graph, "hum")
+        self.set_active_graph("temp")
+        self.apply_markers_visibility()
 
-        self.figure = Figure(figsize=(8, 5), dpi=100)
-        self.ax = self.figure.add_subplot(111)
-        self.ax.set_title("Temperature")
-        self.ax.set_title("", loc="left")
-        self.ax.set_xlabel("Time")
-        self.ax.set_ylabel("Temperature (Â°C)")
+        self.build_sessions_tab(self.tab_sessions)
+        self.refresh_sessions_list()
 
-        locator = AutoDateLocator()
-        self.ax.xaxis.set_major_locator(locator)
-        self.ax.xaxis.set_major_formatter(ConciseDateFormatter(locator))
-        self.apply_grid_settings()
-        self.figure.autofmt_xdate(rotation=30)
+    # â”€â”€ Graph scroll / zoom â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-        self.lines = []
-        for i in range(self.CHANNEL_COUNT):
-            line, = self.ax.plot([], [], label=self.channel_names[i], linewidth=2,
-                                 color=self.channel_colors[i])
-            self.lines.append(line)
-        self.refresh_legend()
-
-        self.ax.callbacks.connect("xlim_changed", self._on_xlim_changed)
-
-        self.canvas = FigureCanvasTkAgg(self.figure, master=chart_frame)
-        self.canvas.mpl_connect("button_press_event", self._on_mouse_press)
-        self.canvas.mpl_connect("motion_notify_event", self._on_mouse_drag)
-        self.canvas.mpl_connect("button_release_event", self._on_mouse_release)
-        self.canvas.mpl_connect("scroll_event", self._on_mouse_wheel)
-
-        # Toolbar row
-        toolbar_row = tk.Frame(self.tab_graph, bg="#f4f4f4", bd=1, relief="flat")
+    def build_graph_tab(self, parent, kind):
+        content_frame = tk.Frame(parent)
+        toolbar_row = tk.Frame(parent, bg="#f4f4f4", bd=1, relief="flat")
         toolbar_row.pack(side=tk.TOP, fill=tk.X)
 
         tk.Label(
             toolbar_row,
-            text="Left-drag â†’ pan     Double-click â†’ add marker     Double-click marker â†’ edit",
+            text="Left-drag -> pan     Double-click -> add marker     Double-click marker -> edit",
             font=("Segoe UI", 8), fg="#666666", bg="#f4f4f4"
         ).pack(side=tk.LEFT, padx=(8, 6), pady=5)
 
         ttk.Separator(toolbar_row, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=4, pady=3)
 
         btn_kw = dict(font=("Segoe UI", 9, "bold"), relief="groove", bd=1, padx=6, pady=2)
-        tk.Button(toolbar_row, text="Reset View", command=self._reset_view,
-                  bg="#e8e8e8", **btn_kw).pack(side=tk.LEFT, padx=(0, 2), pady=4)
-        tk.Button(toolbar_row, text=" \u2212 ", command=self._zoom_out,
-                  bg="#e8e8e8", **btn_kw).pack(side=tk.LEFT, padx=1, pady=4)
-        tk.Button(toolbar_row, text=" + ", command=self._zoom_in,
-                  bg="#e8e8e8", **btn_kw).pack(side=tk.LEFT, padx=(1, 0), pady=4)
+        tk.Button(
+            toolbar_row, text="Reset View",
+            command=lambda graph_kind=kind: self._reset_view(graph_kind=graph_kind),
+            bg="#e8e8e8", **btn_kw
+        ).pack(side=tk.LEFT, padx=(0, 2), pady=4)
+        tk.Button(
+            toolbar_row, text=" - ",
+            command=lambda graph_kind=kind: self._zoom_out(graph_kind=graph_kind),
+            bg="#e8e8e8", **btn_kw
+        ).pack(side=tk.LEFT, padx=1, pady=4)
+        tk.Button(
+            toolbar_row, text=" + ",
+            command=lambda graph_kind=kind: self._zoom_in(graph_kind=graph_kind),
+            bg="#e8e8e8", **btn_kw
+        ).pack(side=tk.LEFT, padx=(1, 0), pady=4)
 
         ttk.Separator(toolbar_row, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=3)
 
+        content_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        graph_split = tk.PanedWindow(content_frame, orient=tk.HORIZONTAL, sashrelief="raised")
+        graph_split.pack(fill=tk.BOTH, expand=True)
+        chart_frame = tk.Frame(graph_split)
+        graph_split.add(chart_frame, minsize=560)
+
+        figure = Figure(figsize=(8, 5), dpi=100)
+        ax = figure.add_subplot(111)
+        ax.set_title(self.graph_title_text(kind))
+        ax.set_title("", loc="left")
+        ax.set_xlabel("Time")
+        ax.set_ylabel(self.graph_y_label(kind))
+
+        locator = AutoDateLocator()
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(ConciseDateFormatter(locator))
+        figure.autofmt_xdate(rotation=30)
+
+        lines = []
+        for i in range(self.CHANNEL_COUNT):
+            line, = ax.plot([], [], label=self.channel_names[i], linewidth=2, color=self.channel_colors[i])
+            lines.append(line)
+
+        canvas = FigureCanvasTkAgg(figure, master=chart_frame)
+        canvas.mpl_connect("button_press_event", lambda event, graph_kind=kind: self._on_mouse_press(event, graph_kind=graph_kind))
+        canvas.mpl_connect("motion_notify_event", lambda event, graph_kind=kind: self._on_mouse_drag(event, graph_kind=graph_kind))
+        canvas.mpl_connect("button_release_event", lambda event, graph_kind=kind: self._on_mouse_release(event, graph_kind=graph_kind))
+        canvas.mpl_connect("scroll_event", lambda event, graph_kind=kind: self._on_mouse_wheel(event, graph_kind=graph_kind))
+        canvas.mpl_connect("figure_leave_event", lambda event, graph_kind=kind: self._on_graph_leave(graph_kind))
+        ax.callbacks.connect("xlim_changed", lambda changed_ax, graph_kind=kind: self._on_xlim_changed(changed_ax, graph_kind=graph_kind))
+
         nav_frame = tk.Frame(toolbar_row, bg="#f4f4f4")
         nav_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.toolbar = NavigationToolbar2Tk(self.canvas, nav_frame)
-        self.toolbar.update()
+        toolbar = NavigationToolbar2Tk(canvas, nav_frame)
+        toolbar.update()
+        if hasattr(toolbar, "_message_label"):
+            try:
+                toolbar._message_label.pack_forget()
+            except Exception:
+                pass
+        toolbar.set_message = lambda _s: None
+        ttk.Separator(toolbar_row, orient="vertical").pack(side=tk.LEFT, fill=tk.Y, padx=6, pady=3)
 
-        # Content area
-        content_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        chart_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        if not hasattr(self, "markers_visible_var"):
+            self.markers_visible_var = tk.BooleanVar(value=self.markers_visible)
+        tk.Checkbutton(
+            toolbar_row,
+            text="Markers Panel",
+            variable=self.markers_visible_var,
+            onvalue=True,
+            offvalue=False,
+            bg="#f4f4f4",
+            command=self.on_markers_visibility_toggle
+        ).pack(side=tk.RIGHT, padx=(4, 8), pady=4)
 
-        self.h_scroll = ttk.Scrollbar(chart_frame, orient=tk.HORIZONTAL,
-                                       command=self._on_xscroll)
-        self.h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        h_scroll = ttk.Scrollbar(
+            chart_frame, orient=tk.HORIZONTAL,
+            command=lambda action, *args, graph_kind=kind: self._on_xscroll(action, *args, graph_kind=graph_kind)
+        )
+        h_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # Markers panel
-        markers_panel = tk.Frame(content_frame, width=265, bg="#f0f0f0", bd=1, relief="sunken")
-        markers_panel.pack(side=tk.RIGHT, fill=tk.Y)
+        markers_panel = tk.Frame(graph_split, width=265, bg="#f0f0f0", bd=1, relief="sunken")
         markers_panel.pack_propagate(False)
-
         tk.Label(markers_panel, text="Markers", bg="#f0f0f0",
                  font=("Segoe UI", 11, "bold"), pady=6).pack(fill=tk.X, padx=8)
         ttk.Separator(markers_panel, orient="horizontal").pack(fill=tk.X)
 
-        list_frame = tk.Frame(markers_panel, bg="#f0f0f0")
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        markers_list_frame = tk.Frame(markers_panel, bg="#f0f0f0")
+        markers_list_frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        sb = ttk.Scrollbar(markers_list_frame, orient=tk.VERTICAL)
 
-        self.markers_listbox = tk.Listbox(
-            list_frame, yscrollcommand=sb.set,
+        markers_listbox = tk.Listbox(
+            markers_list_frame,
             font=("Consolas", 8), selectmode=tk.SINGLE,
             bg="#ffffff", activestyle="none", bd=0, relief="flat"
         )
-        self.markers_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        sb.config(command=self.markers_listbox.yview)
-        self.markers_listbox.bind("<Double-1>", self.on_listbox_double_click)
+        markers_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.config(command=markers_listbox.yview)
+        markers_listbox.configure(
+            yscrollcommand=lambda first, last, scrollbar=sb: self._set_listbox_scrollbar(
+                scrollbar, first, last
+            )
+        )
+        markers_listbox.bind(
+            "<Double-1>",
+            lambda event, graph_kind=kind: self.on_listbox_double_click(event, graph_kind=graph_kind)
+        )
 
         tk.Button(
-            markers_panel, text="Delete Selected", command=self.delete_marker,
+            markers_panel, text="Delete Selected",
+            command=lambda graph_kind=kind: self.delete_marker(graph_kind=graph_kind),
             bg="#c0392b", fg="white", font=("Segoe UI", 9), pady=4
         ).pack(fill=tk.X, padx=8, pady=(0, 8))
 
-        self.build_sessions_tab(self.tab_sessions)
-        self.refresh_sessions_list()
-
-    # â”€â”€ Graph scroll / zoom â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        self.graph_contexts[kind] = {
+            "content_frame": content_frame,
+            "graph_split": graph_split,
+            "figure": figure,
+            "ax": ax,
+            "canvas": canvas,
+            "toolbar": toolbar,
+            "h_scroll": h_scroll,
+            "lines": lines,
+            "markers_panel": markers_panel,
+            "markers_listbox": markers_listbox,
+            "markers_scrollbar": sb,
+            "legend_expanded": False,
+        }
+        graph_split.bind("<ButtonRelease-1>", lambda _event, graph_kind=kind: self._on_graph_split_released(graph_kind))
+        self.apply_grid_settings()
+        self.refresh_legend(kind)
+        self._refresh_listbox_scrollbar(markers_listbox, sb)
 
     def place_top_logo(self, parent):
         icon_path = os.path.join(self.resource_dir, "icons", "logo.png")
@@ -988,6 +1557,99 @@ class ArduinoLoggerApp:
             except Exception:
                 pass
 
+    def _set_graph_split(self, x, graph_kind=None):
+        ctx = self.graph_contexts.get(graph_kind or self.active_graph_kind)
+        if ctx is None:
+            return
+        try:
+            ctx["graph_split"].sash_place(0, int(x), 0)
+        except Exception:
+            pass
+
+    def _graph_split_target_x(self, graph_kind=None):
+        ctx = self.graph_contexts.get(graph_kind or self.active_graph_kind)
+        if ctx is None:
+            return None
+        try:
+            total_width = int(ctx["graph_split"].winfo_width())
+        except Exception:
+            total_width = 0
+        if total_width <= 1:
+            return self.saved_graph_split_x
+        ratio = self.saved_graph_split_ratio
+        if ratio is None:
+            ratio = self.DEFAULT_GRAPH_SPLIT_RATIO
+        return int(round(total_width * ratio))
+
+    def _capture_graph_split_x(self, graph_kind=None):
+        ctx = self.graph_contexts.get(graph_kind or self.active_graph_kind)
+        if ctx is None or not self.markers_visible:
+            return
+        try:
+            split_x = int(ctx["graph_split"].sash_coord(0)[0])
+        except Exception:
+            split_x = None
+        if split_x is not None and split_x > 100:
+            self.saved_graph_split_x = split_x
+            try:
+                total_width = int(ctx["graph_split"].winfo_width())
+            except Exception:
+                total_width = 0
+            if total_width > 1:
+                ratio = float(split_x) / float(total_width)
+                self.saved_graph_split_ratio = max(0.50, min(0.90, ratio))
+
+    def _graph_pane_names(self, graph_kind=None):
+        ctx = self.graph_contexts.get(graph_kind or self.active_graph_kind)
+        if ctx is None:
+            return set()
+        try:
+            return {str(name) for name in ctx["graph_split"].panes()}
+        except Exception:
+            return set()
+
+    def _attach_markers_panel(self, graph_kind=None):
+        ctx = self.graph_contexts.get(graph_kind or self.active_graph_kind)
+        if ctx is None:
+            return
+        markers_pane_name = str(ctx["markers_panel"])
+        if markers_pane_name not in self._graph_pane_names(graph_kind):
+            ctx["graph_split"].add(ctx["markers_panel"], minsize=220)
+        self.root.after(
+            10,
+            lambda graph_kind=graph_kind or self.active_graph_kind: self._apply_graph_split_to_kind(graph_kind)
+        )
+
+    def _detach_markers_panel(self, graph_kind=None):
+        ctx = self.graph_contexts.get(graph_kind or self.active_graph_kind)
+        if ctx is None:
+            return
+        markers_pane_name = str(ctx["markers_panel"])
+        if markers_pane_name in self._graph_pane_names(graph_kind):
+            self._capture_graph_split_x(graph_kind)
+            try:
+                ctx["graph_split"].forget(ctx["markers_panel"])
+            except Exception:
+                pass
+
+    def _apply_graph_split_to_kind(self, graph_kind):
+        target_x = self._graph_split_target_x(graph_kind)
+        if target_x is not None:
+            self._set_graph_split(target_x, graph_kind=graph_kind)
+
+    def _apply_graph_split_to_all(self, exclude_kind=None):
+        for graph_kind in self.graph_contexts:
+            if graph_kind == exclude_kind:
+                continue
+            self._apply_graph_split_to_kind(graph_kind)
+
+    def _on_graph_split_released(self, graph_kind):
+        if not self.markers_visible:
+            return
+        self._capture_graph_split_x(graph_kind)
+        self._apply_graph_split_to_all(exclude_kind=graph_kind)
+        self.save_config()
+
     def _append_to_console_widget(self, widget, text, auto_newline=True):
         if widget is None:
             return
@@ -1044,6 +1706,102 @@ class ArduinoLoggerApp:
         self.terminal_mode = "docked"
         self.apply_terminal_mode(persist=True)
 
+    def _create_floating_markers_window(self):
+        if self.markers_window is not None and self.markers_window.winfo_exists():
+            self.markers_window.deiconify()
+            self.markers_window.lift()
+            return
+
+        self.markers_window = tk.Toplevel(self.root)
+        self.markers_window.title("Markers")
+        self.markers_window.geometry("420x420")
+        self.markers_window.transient(self.root)
+
+        tk.Label(self.markers_window, text="Markers", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=8, pady=(8, 4)
+        )
+        list_frame = tk.Frame(self.markers_window, bg="#f0f0f0")
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+
+        sb = ttk.Scrollbar(list_frame, orient=tk.VERTICAL)
+        self.floating_markers_scrollbar = sb
+
+        self.floating_markers_listbox = tk.Listbox(
+            list_frame,
+            font=("Consolas", 8),
+            selectmode=tk.SINGLE,
+            bg="#ffffff",
+            activestyle="none",
+            bd=0,
+            relief="flat"
+        )
+        self.floating_markers_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.config(command=self.floating_markers_listbox.yview)
+        self.floating_markers_listbox.configure(
+            yscrollcommand=lambda first, last, scrollbar=sb: self._set_listbox_scrollbar(
+                scrollbar, first, last
+            )
+        )
+        self.floating_markers_listbox.bind(
+            "<Double-1>",
+            lambda event: self.on_listbox_double_click(event, source_listbox=self.floating_markers_listbox)
+        )
+
+        tk.Button(
+            self.markers_window,
+            text="Delete Selected",
+            command=lambda: self.delete_marker(source_listbox=self.floating_markers_listbox),
+            bg="#c0392b",
+            fg="white",
+            font=("Segoe UI", 9),
+            pady=4
+        ).pack(fill=tk.X, padx=8, pady=(0, 8))
+
+        self._rebuild_listbox()
+        self._refresh_listbox_scrollbar(self.floating_markers_listbox, sb)
+        self.markers_window.protocol("WM_DELETE_WINDOW", self._on_markers_window_close)
+
+    def _destroy_floating_markers_window(self):
+        if self.markers_window is not None:
+            try:
+                if self.markers_window.winfo_exists():
+                    self.markers_window.destroy()
+            except Exception:
+                pass
+        self.markers_window = None
+        self.floating_markers_listbox = None
+        self.floating_markers_scrollbar = None
+
+    def _on_markers_window_close(self):
+        self.markers_floating = False
+        self.apply_markers_mode(persist=True)
+
+    def _set_listbox_scrollbar(self, scrollbar, first, last):
+        if scrollbar is None:
+            return
+        try:
+            first_val = float(first)
+            last_val = float(last)
+        except Exception:
+            first_val = 0.0
+            last_val = 1.0
+        scrollbar.set(first, last)
+        if first_val <= 0.0 and last_val >= 1.0:
+            if scrollbar.winfo_manager():
+                scrollbar.pack_forget()
+        elif not scrollbar.winfo_manager():
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _refresh_listbox_scrollbar(self, listbox, scrollbar):
+        if listbox is None or scrollbar is None:
+            return
+        try:
+            listbox.update_idletasks()
+            first, last = listbox.yview()
+        except Exception:
+            first, last = (0.0, 1.0)
+        self._set_listbox_scrollbar(scrollbar, first, last)
+
     def apply_terminal_mode(self, persist=True):
         if not hasattr(self, "live_split") or not hasattr(self, "live_right"):
             return
@@ -1072,6 +1830,48 @@ class ArduinoLoggerApp:
     def _apply_initial_live_layout(self):
         self.apply_terminal_mode(persist=False)
 
+    def apply_markers_mode(self, persist=True):
+        if self.markers_floating and self.markers_visible:
+            for graph_kind in self.graph_contexts:
+                self._detach_markers_panel(graph_kind)
+            self._create_floating_markers_window()
+        else:
+            self._destroy_floating_markers_window()
+            if self.markers_visible:
+                for graph_kind in self.graph_contexts:
+                    self._attach_markers_panel(graph_kind)
+            else:
+                for graph_kind in self.graph_contexts:
+                    self._detach_markers_panel(graph_kind)
+
+        if hasattr(self, "markers_visible_var"):
+            self.markers_visible_var.set(self.markers_visible)
+        if hasattr(self, "markers_floating_var"):
+            self.markers_floating_var.set(self.markers_floating)
+        if persist:
+            self.save_config()
+
+    def _set_sessions_split(self, x):
+        if not hasattr(self, "sessions_split"):
+            return
+        try:
+            self.sessions_split.sash_place(0, int(x), 0)
+        except Exception:
+            pass
+
+    def _apply_initial_sessions_layout(self):
+        if not hasattr(self, "sessions_split"):
+            return
+        try:
+            total_width = int(self.sessions_split.winfo_width())
+        except Exception:
+            total_width = 0
+        if total_width <= 1:
+            self.root.after(20, self._apply_initial_sessions_layout)
+            return
+        target_x = max(760, int(total_width * 0.74))
+        self._set_sessions_split(target_x)
+
     def build_sessions_tab(self, parent):
         top = tk.Frame(parent, bg="#f4f4f4", bd=1, relief="flat")
         top.pack(side=tk.TOP, fill=tk.X)
@@ -1088,13 +1888,14 @@ class ArduinoLoggerApp:
         tk.Button(top, text="Delete Session", width=12, command=self.delete_selected_session,
                   bg="#c0392b", fg="white").pack(side=tk.LEFT, padx=6, pady=6)
 
-        split = tk.PanedWindow(parent, orient=tk.HORIZONTAL, sashrelief="raised")
-        split.pack(fill=tk.BOTH, expand=True)
+        self.sessions_split = tk.PanedWindow(parent, orient=tk.HORIZONTAL, sashrelief="raised")
+        self.sessions_split.pack(fill=tk.BOTH, expand=True)
 
-        left = tk.Frame(split)
-        right = tk.Frame(split)
-        split.add(left, minsize=560)
-        split.add(right, minsize=280)
+        left = tk.Frame(self.sessions_split)
+        right = tk.Frame(self.sessions_split)
+        self.sessions_split.add(left, minsize=720)
+        self.sessions_split.add(right, minsize=220)
+        self.root.after(10, self._apply_initial_sessions_layout)
 
         self.sessions_tree = ttk.Treeview(
             left,
@@ -1108,20 +1909,22 @@ class ArduinoLoggerApp:
         self.sessions_tree.heading("rows", text="Readings")
         self.sessions_tree.heading("markers", text="Marker Events")
         self.sessions_tree.heading("state", text="State")
-        self.sessions_tree.column("id", width=55, anchor="center")
-        self.sessions_tree.column("name", width=150, anchor="w")
-        self.sessions_tree.column("started", width=170, anchor="w")
-        self.sessions_tree.column("ended", width=170, anchor="w")
-        self.sessions_tree.column("rows", width=85, anchor="e")
-        self.sessions_tree.column("markers", width=100, anchor="e")
-        self.sessions_tree.column("state", width=75, anchor="center")
+        self.sessions_tree.column("id", width=45, anchor="center")
+        self.sessions_tree.column("name", width=140, anchor="w")
+        self.sessions_tree.column("started", width=145, anchor="w")
+        self.sessions_tree.column("ended", width=145, anchor="w")
+        self.sessions_tree.column("rows", width=80, anchor="e")
+        self.sessions_tree.column("markers", width=120, anchor="e")
+        self.sessions_tree.column("state", width=95, anchor="center")
         self.sessions_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.sessions_tree.bind("<<TreeviewSelect>>", self.on_session_select)
         self.sessions_tree.bind("<Double-1>", self.on_sessions_tree_double_click)
 
         sb = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.sessions_tree.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.sessions_tree.configure(yscrollcommand=sb.set)
+        sb_x = ttk.Scrollbar(left, orient=tk.HORIZONTAL, command=self.sessions_tree.xview)
+        sb_x.pack(side=tk.BOTTOM, fill=tk.X)
+        self.sessions_tree.configure(yscrollcommand=sb.set, xscrollcommand=sb_x.set)
 
         tk.Label(right, text="Session Preview", font=("Segoe UI", 10, "bold")).pack(
             anchor="w", padx=8, pady=(8, 4)
@@ -1253,14 +2056,15 @@ class ArduinoLoggerApp:
 
     def _clear_all_markers(self):
         for marker in self.markers:
-            try:
-                marker["vline"].remove()
-            except Exception:
-                pass
-            try:
-                marker["annotation"].remove()
-            except Exception:
-                pass
+            for artists in marker.get("artists", {}).values():
+                try:
+                    artists["vline"].remove()
+                except Exception:
+                    pass
+                try:
+                    artists["annotation"].remove()
+                except Exception:
+                    pass
         self.markers = []
         self._rebuild_listbox()
 
@@ -1306,13 +2110,17 @@ class ArduinoLoggerApp:
     def load_session_to_graph(self, session_id):
         self._clear_all_markers()
         self.esp_slot_by_node_id.clear()
+        self.esp_node_state.clear()
         for i in range(self.CHANNEL_COUNT):
             self.temp_history[i].clear()
+            self.hum_history[i].clear()
             self.series_times[i].clear()
-            self.series_values[i].clear()
+            self.temp_series_values[i].clear()
+            self.hum_series_values[i].clear()
             self.last_plot_second[i] = None
             self.current_temps[i] = "NaN"
             self.current_hums[i] = "NaN"
+            self.current_signals[i] = "-"
 
         rows = self.db_conn.execute(
             "SELECT timestamp, {0} FROM readings WHERE session_id = ? ORDER BY timestamp".format(
@@ -1327,13 +2135,22 @@ class ArduinoLoggerApp:
             for i in range(self.CHANNEL_COUNT):
                 temp_text = row[1 + 2 * i]
                 hum_text = row[2 + 2 * i]
+                temp_value = None
+                hum_value = None
                 if temp_text not in (None, ""):
                     self.current_temps[i] = str(temp_text)
-                    self.current_hums[i] = str(hum_text) if hum_text not in (None, "") else ""
                     try:
-                        self.add_smoothed_point(i, dt, float(temp_text))
+                        temp_value = float(temp_text)
                     except (TypeError, ValueError):
-                        pass
+                        temp_value = None
+                if hum_text not in (None, ""):
+                    self.current_hums[i] = str(hum_text)
+                    try:
+                        hum_value = float(hum_text)
+                    except (TypeError, ValueError):
+                        hum_value = None
+                if temp_value is not None or hum_value is not None:
+                    self.add_smoothed_point(i, dt, temp_value, hum_value)
 
         for marker in self._get_final_markers_for_session(session_id):
             self._place_marker(marker["datetime"], marker["note"], save_to_db=False)
@@ -1346,9 +2163,10 @@ class ArduinoLoggerApp:
                 temp_disp = "{0} \u00b0C".format(self.current_temps[i])
             if self.current_hums[i] not in ("NaN", "", None):
                 hum_disp = "{0} %".format(self.current_hums[i])
-            self.update_channel_tree_row(i, temp_disp, hum_disp)
+            self.update_channel_tree_row(i, temp_disp, hum_disp, self.current_signals[i])
 
-        self.ax.set_title(self.get_session_name(session_id), loc="left")
+        self.loaded_session_id = session_id
+        self.refresh_graph_titles()
         self._auto_view = True
         self._schedule_redraw()
 
@@ -1443,7 +2261,9 @@ class ArduinoLoggerApp:
             return None
         return (lo, hi)
 
-    def _on_xlim_changed(self, ax):
+    def _on_xlim_changed(self, ax, graph_kind=None):
+        if graph_kind is not None:
+            self.set_active_graph(graph_kind)
         if self._ignore_xlim_changes > 0:
             self._ignore_xlim_changes -= 1
             self._update_scrollbar()
@@ -1452,7 +2272,9 @@ class ArduinoLoggerApp:
             self._auto_view = False
         self._update_scrollbar()
 
-    def _update_scrollbar(self):
+    def _update_scrollbar(self, graph_kind=None):
+        if graph_kind is not None:
+            self.set_active_graph(graph_kind)
         lims = self._data_xlim()
         if lims is None:
             self.h_scroll.set(0, 1)
@@ -1464,7 +2286,10 @@ class ArduinoLoggerApp:
         sb_hi = max(0.0, min(1.0, (view_hi - data_lo) / span))
         self.h_scroll.set(sb_lo, sb_hi)
 
-    def _on_xscroll(self, action, *args):
+    def _on_xscroll(self, action, *args, **kwargs):
+        graph_kind = kwargs.get("graph_kind")
+        if graph_kind is not None:
+            self.set_active_graph(graph_kind)
         lims = self._data_xlim()
         if lims is None:
             return
@@ -1504,7 +2329,9 @@ class ArduinoLoggerApp:
             return mid - half, mid + half
         return new_lo, new_hi
 
-    def _apply_zoom(self, scale, x_focus=None, y_focus=None):
+    def _apply_zoom(self, scale, x_focus=None, y_focus=None, graph_kind=None):
+        if graph_kind is not None:
+            self.set_active_graph(graph_kind)
         x_lo, x_hi = self.ax.get_xlim()
         y_lo, y_hi = self.ax.get_ylim()
         new_x_lo, new_x_hi = self._zoom_axis(x_lo, x_hi, x_focus, scale)
@@ -1513,13 +2340,15 @@ class ArduinoLoggerApp:
         self.ax.set_ylim(new_y_lo, new_y_hi)
         self.canvas.draw_idle()
 
-    def _zoom_in(self, x_focus=None, y_focus=None):
-        self._apply_zoom(self.ZOOM_FACTOR, x_focus=x_focus, y_focus=y_focus)
+    def _zoom_in(self, x_focus=None, y_focus=None, graph_kind=None):
+        self._apply_zoom(self.ZOOM_FACTOR, x_focus=x_focus, y_focus=y_focus, graph_kind=graph_kind)
 
-    def _zoom_out(self, x_focus=None, y_focus=None):
-        self._apply_zoom(1.0 / self.ZOOM_FACTOR, x_focus=x_focus, y_focus=y_focus)
+    def _zoom_out(self, x_focus=None, y_focus=None, graph_kind=None):
+        self._apply_zoom(1.0 / self.ZOOM_FACTOR, x_focus=x_focus, y_focus=y_focus, graph_kind=graph_kind)
 
-    def _reset_view(self):
+    def _reset_view(self, graph_kind=None):
+        if graph_kind is not None:
+            self.set_active_graph(graph_kind)
         self._auto_view = True
         self._ignore_xlim_changes += 1
         self._in_redraw = True
@@ -1529,31 +2358,52 @@ class ArduinoLoggerApp:
         self.canvas.draw_idle()
 
     def on_tab_changed(self, _event):
-        if self.notebook.select() == str(self.tab_graph):
+        selected = self.notebook.select()
+        if selected == str(self.tab_graph):
+            self.set_active_graph("temp")
+            self._auto_view = True
+            self._schedule_redraw()
+        elif selected == str(self.tab_humidity_graph):
+            self.set_active_graph("hum")
             self._auto_view = True
             self._schedule_redraw()
         elif hasattr(self, "tab_sessions") and self.notebook.select() == str(self.tab_sessions):
             self.refresh_sessions_list()
 
     def apply_grid_settings(self):
-        if not hasattr(self, "ax"):
+        if not self.graph_contexts:
             return
-        self.ax.grid(True, which="major", color="gainsboro", linewidth=0.8)
-        if self.minor_grid_enabled:
-            self.ax.yaxis.set_minor_locator(MultipleLocator(1.0))
-            self.ax.xaxis.set_minor_locator(AutoMinorLocator(5))
-            self.ax.grid(True, which="minor", color="#ededed", linestyle=":", linewidth=0.6)
-        else:
-            self.ax.yaxis.set_minor_locator(NullLocator())
-            self.ax.xaxis.set_minor_locator(NullLocator())
-            self.ax.grid(False, which="minor")
+        for ctx in self.graph_contexts.values():
+            ax = ctx["ax"]
+            ax.grid(True, which="major", color="gainsboro", linewidth=0.8)
+            if self.minor_grid_enabled:
+                ax.yaxis.set_minor_locator(MultipleLocator(1.0))
+                ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+                ax.grid(True, which="minor", color="#ededed", linestyle=":", linewidth=0.6)
+            else:
+                ax.yaxis.set_minor_locator(NullLocator())
+                ax.xaxis.set_minor_locator(NullLocator())
+                ax.grid(False, which="minor")
 
     def on_minor_grid_toggle(self):
         self.minor_grid_enabled = bool(self.minor_grid_var.get())
         self.apply_grid_settings()
-        if hasattr(self, "canvas"):
-            self.canvas.draw_idle()
+        for ctx in self.graph_contexts.values():
+            ctx["canvas"].draw_idle()
         self.save_config()
+
+    def apply_markers_visibility(self):
+        self.apply_markers_mode(persist=False)
+
+    def on_markers_visibility_toggle(self):
+        self.markers_visible = bool(self.markers_visible_var.get())
+        self.apply_markers_mode(persist=True)
+
+    def on_markers_floating_toggle(self):
+        self.markers_floating = bool(self.markers_floating_var.get())
+        if self.markers_floating:
+            self.markers_visible = True
+        self.apply_markers_mode(persist=True)
 
     def on_terminal_visibility_toggle(self):
         if bool(self.terminal_visible_var.get()):
@@ -1613,6 +2463,127 @@ class ArduinoLoggerApp:
         btn_row = tk.Frame(dialog)
         btn_row.grid(row=4, column=0, columnspan=2, pady=(4, 0))
         tk.Button(btn_row, text="Refresh", command=refresh_dialog_ports, padx=14).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_row, text="Apply", command=apply_and_close, bg="#4a90d9", fg="white", padx=18).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_row, text="Close", command=dialog.destroy, padx=18).pack(side=tk.LEFT, padx=6)
+
+    def open_application_settings(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Application Settings")
+        dialog.geometry("520x420")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        notebook = ttk.Notebook(dialog)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 6))
+
+        tabs = {
+            "channels": ttk.Frame(notebook),
+            "serial": ttk.Frame(notebook),
+            "files": ttk.Frame(notebook),
+            "plot": ttk.Frame(notebook),
+        }
+        notebook.add(tabs["channels"], text="Channels")
+        notebook.add(tabs["serial"], text="Serial")
+        notebook.add(tabs["files"], text="Files")
+        notebook.add(tabs["plot"], text="Plot")
+
+        vars_map = {
+            "arduino_channel_count": tk.StringVar(value=str(self.runtime_settings["arduino_channel_count"])),
+            "esp_channel_count": tk.StringVar(value=str(self.runtime_settings["esp_channel_count"])),
+            "default_interval_text": tk.StringVar(value=str(self.runtime_settings["default_interval_text"])),
+            "smoothing_window": tk.StringVar(value=str(self.runtime_settings["smoothing_window"])),
+            "arduino_baud_rate": tk.StringVar(value=str(self.runtime_settings["arduino_baud_rate"])),
+            "esp_baud_rate": tk.StringVar(value=str(self.runtime_settings["esp_baud_rate"])),
+            "db_file_name": tk.StringVar(value=str(self.runtime_settings["db_file_name"])),
+            "temp_data_file_name": tk.StringVar(value=str(self.runtime_settings["temp_data_file_name"])),
+            "hum_data_file_name": tk.StringVar(value=str(self.runtime_settings["hum_data_file_name"])),
+            "plot_history_seconds": tk.StringVar(value=str(self.runtime_settings["plot_history_seconds"])),
+            "max_render_points": tk.StringVar(value=str(self.runtime_settings["max_render_points"])),
+            "zoom_factor": tk.StringVar(value=str(self.runtime_settings["zoom_factor"])),
+            "default_graph_split_ratio": tk.StringVar(value=str(self.runtime_settings["default_graph_split_ratio"])),
+        }
+
+        def add_entry(parent, row, label, key, width=18, note=""):
+            tk.Label(parent, text=label, anchor="w", font=("Segoe UI", 10)).grid(
+                row=row, column=0, sticky="w", padx=(12, 8), pady=7
+            )
+            tk.Entry(parent, textvariable=vars_map[key], width=width, font=("Segoe UI", 10)).grid(
+                row=row, column=1, sticky="w", padx=(0, 12), pady=7
+            )
+            if note:
+                tk.Label(parent, text=note, anchor="w", fg="#666666", font=("Segoe UI", 8)).grid(
+                    row=row, column=2, sticky="w", padx=(0, 10), pady=7
+                )
+
+        add_entry(tabs["channels"], 0, "Arduino channels", "arduino_channel_count", note="Restart required")
+        add_entry(tabs["channels"], 1, "ESP channels", "esp_channel_count", note="Restart required")
+        add_entry(tabs["channels"], 2, "Default interval", "default_interval_text", note="e.g. 1s, 500ms")
+        add_entry(tabs["channels"], 3, "Smoothing window", "smoothing_window", note="Restart required")
+
+        add_entry(tabs["serial"], 0, "Arduino baud", "arduino_baud_rate", note="Next connection")
+        add_entry(tabs["serial"], 1, "ESP baud", "esp_baud_rate", note="Next connection")
+
+        add_entry(tabs["files"], 0, "Database filename", "db_file_name", note="Restart required")
+        add_entry(tabs["files"], 1, "Temp output filename", "temp_data_file_name")
+        add_entry(tabs["files"], 2, "Hum output filename", "hum_data_file_name")
+        tk.Label(
+            tabs["files"],
+            text="Filenames are stored in the app folder. Do not enter directories.",
+            fg="#666666",
+            font=("Segoe UI", 8)
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=12, pady=(4, 0))
+
+        add_entry(tabs["plot"], 0, "Plot history (sec)", "plot_history_seconds", note="Restart required")
+        add_entry(tabs["plot"], 1, "Max render points", "max_render_points")
+        add_entry(tabs["plot"], 2, "Zoom factor", "zoom_factor", note="0.10 - 0.95")
+        add_entry(tabs["plot"], 3, "Default split ratio", "default_graph_split_ratio", note="0.50 - 0.90")
+
+        tk.Label(
+            dialog,
+            text="Channel counts, smoothing, database filename, and plot history are applied on next restart.",
+            fg="#666666",
+            font=("Segoe UI", 8)
+        ).pack(anchor="w", padx=14, pady=(0, 4))
+
+        def apply_and_close():
+            raw_settings = {key: var.get().strip() for key, var in vars_map.items()}
+            if self.parse_interval_ms(raw_settings["default_interval_text"]) is None:
+                messagebox.showwarning("Application Settings", "Default interval must use a format like 500ms, 1s, 2min, or 1h.", parent=dialog)
+                return
+            for file_key in ("db_file_name", "temp_data_file_name", "hum_data_file_name"):
+                filename = raw_settings[file_key]
+                if not filename or os.path.basename(filename) != filename:
+                    messagebox.showwarning("Application Settings", "Filenames must be plain file names without folders.", parent=dialog)
+                    return
+
+            new_settings = self.sanitize_runtime_settings(raw_settings)
+            restart_keys = {
+                "arduino_channel_count",
+                "esp_channel_count",
+                "smoothing_window",
+                "db_file_name",
+                "plot_history_seconds",
+            }
+            old_settings = dict(self.runtime_settings)
+            restart_required = any(new_settings[key] != old_settings.get(key) for key in restart_keys)
+            self.runtime_settings = new_settings
+            self.apply_live_runtime_settings()
+            self.saved_interval_text = self.runtime_settings["default_interval_text"]
+            if hasattr(self, "txt_interval") and not self.any_source_connected():
+                self.txt_interval.delete(0, tk.END)
+                self.txt_interval.insert(0, self.saved_interval_text)
+            self.save_config()
+            dialog.destroy()
+
+            if restart_required:
+                messagebox.showinfo(
+                    "Application Settings",
+                    "Settings saved.\n\nRestart the app to apply channel counts, smoothing window, database filename, and plot history changes."
+                )
+
+        btn_row = tk.Frame(dialog)
+        btn_row.pack(pady=(0, 10))
         tk.Button(btn_row, text="Apply", command=apply_and_close, bg="#4a90d9", fg="white", padx=18).pack(side=tk.LEFT, padx=6)
         tk.Button(btn_row, text="Close", command=dialog.destroy, padx=18).pack(side=tk.LEFT, padx=6)
 
@@ -1841,9 +2812,9 @@ class ArduinoLoggerApp:
         dialog.wait_window()
 
     def channel_record_cell(self, ch_idx):
-        return "[x]" if self.channel_record_enabled[ch_idx] else "[ ]"
+        return "\u2611" if self.channel_record_enabled[ch_idx] else "\u2610"
 
-    def update_channel_tree_row(self, ch_idx, temp_display=None, hum_display=None):
+    def update_channel_tree_row(self, ch_idx, temp_display=None, hum_display=None, signal_display=None):
         row_id = "ch{0}".format(ch_idx)
         if not self.tree.exists(row_id):
             if not self.channel_is_visible_in_ui(ch_idx):
@@ -1856,6 +2827,8 @@ class ArduinoLoggerApp:
             temp_display = cur[3] if len(cur) > 3 else "-"
         if hum_display is None:
             hum_display = cur[4] if len(cur) > 4 else "-"
+        if signal_display is None:
+            signal_display = cur[5] if len(cur) > 5 else "-"
         self.tree.item(
             row_id,
             values=(
@@ -1863,13 +2836,13 @@ class ArduinoLoggerApp:
                 self.channel_display_id(ch_idx),
                 self.channel_tree_name(ch_idx),
                 temp_display,
-                hum_display
+                hum_display,
+                signal_display,
             )
         )
 
     def set_channel_recording(self, ch_idx, enabled):
         self.channel_record_enabled[ch_idx] = bool(enabled)
-        self.lines[ch_idx].set_visible(self.channel_record_enabled[ch_idx] and self.channel_is_visible_in_ui(ch_idx))
         self.update_channel_tree_row(ch_idx)
         self.refresh_legend()
         self._schedule_redraw()
@@ -1906,32 +2879,93 @@ class ArduinoLoggerApp:
             return self.channel_names[ch_idx]
         return "{0} [REC OFF]".format(self.channel_names[ch_idx])
 
-    def refresh_legend(self):
-        visible_lines = [
-            line for i, line in enumerate(self.lines)
-            if self.channel_record_enabled[i] and self.channel_is_visible_in_ui(i)
-        ]
-        if visible_lines:
-            labels = [line.get_label() for line in visible_lines]
-            self.ax.legend(visible_lines, labels, loc="upper left")
-        else:
-            legend = self.ax.get_legend()
-            if legend is not None:
-                legend.remove()
+    def refresh_legend(self, graph_kind=None):
+        graph_kinds = [graph_kind] if graph_kind else list(self.graph_contexts.keys())
+        for kind in graph_kinds:
+            ctx = self.graph_contexts.get(kind)
+            if ctx is None:
+                continue
+            visible_lines = [
+                line for i, line in enumerate(ctx["lines"])
+                if self.channel_record_enabled[i] and self.channel_is_visible_in_ui(i)
+            ]
+            if visible_lines:
+                expanded = bool(ctx.get("legend_expanded"))
+                labels = [
+                    (
+                        self.expanded_channel_legend_label_for_kind(kind, i)
+                        if expanded else
+                        self.compact_channel_legend_label_for_kind(kind, i)
+                    )
+                    for i, line in enumerate(ctx["lines"])
+                    if self.channel_record_enabled[i] and self.channel_is_visible_in_ui(i)
+                ]
+                legend = ctx["ax"].legend(
+                    visible_lines,
+                    labels,
+                    loc="upper left",
+                    fontsize=8 if expanded else 7,
+                    borderpad=0.8 if expanded else 0.35,
+                    labelspacing=0.45 if expanded else 0.25,
+                    handlelength=1.8 if expanded else 1.1,
+                    handletextpad=0.7 if expanded else 0.45,
+                    borderaxespad=0.5,
+                    framealpha=0.90,
+                )
+                ctx["legend"] = legend
+            else:
+                legend = ctx["ax"].get_legend()
+                if legend is not None:
+                    legend.remove()
+                ctx["legend"] = None
+
+    def _set_legend_expanded(self, graph_kind, expanded):
+        ctx = self.graph_contexts.get(graph_kind)
+        if ctx is None:
+            return
+        expanded = bool(expanded)
+        if bool(ctx.get("legend_expanded")) == expanded:
+            return
+        ctx["legend_expanded"] = expanded
+        self.refresh_legend(graph_kind)
+        ctx["canvas"].draw_idle()
+
+    def _update_legend_hover_state(self, event, graph_kind):
+        ctx = self.graph_contexts.get(graph_kind)
+        if ctx is None:
+            return
+        legend = ctx.get("legend")
+        if legend is None:
+            self._set_legend_expanded(graph_kind, False)
+            return
+        contains = False
+        if event is not None and getattr(event, "x", None) is not None and getattr(event, "y", None) is not None:
+            try:
+                renderer = ctx["canvas"].get_renderer()
+            except Exception:
+                renderer = None
+            if renderer is not None:
+                try:
+                    contains = legend.get_window_extent(renderer=renderer).contains(event.x, event.y)
+                except Exception:
+                    contains = False
+        self._set_legend_expanded(graph_kind, contains)
 
     def open_channel_editor(self, ch_idx):
         dialog = tk.Toplevel(self.root)
         dialog.title("Edit Channel {0}".format(ch_idx))
-        dialog.geometry("330x210")
+        dialog.geometry("430x285")
         dialog.resizable(False, False)
         dialog.transient(self.root)
         dialog.grab_set()
 
+        node_id = self.find_esp_node_id_by_slot(ch_idx)
+        is_satellite_channel = ch_idx >= self.ARDUINO_CHANNEL_COUNT
         pad = {"padx": 12, "pady": 8}
         tk.Label(dialog, text="Name:", font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w", **pad)
-        name_var = tk.StringVar(value=self.channel_names[ch_idx])
-        name_entry = tk.Entry(dialog, textvariable=name_var, width=22, font=("Segoe UI", 10))
-        name_entry.grid(row=0, column=1, columnspan=2, sticky="ew", padx=(0, 12), pady=8)
+        name_var = tk.StringVar(value=self.satellite_editor_initial_name(ch_idx))
+        name_entry = tk.Entry(dialog, textvariable=name_var, width=28, font=("Segoe UI", 10))
+        name_entry.grid(row=0, column=1, columnspan=3, sticky="ew", padx=(0, 12), pady=8)
         name_entry.select_range(0, tk.END)
         name_entry.focus()
 
@@ -1956,30 +2990,96 @@ class ArduinoLoggerApp:
             onvalue=True,
             offvalue=False,
             font=("Segoe UI", 10)
-        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=12, pady=(2, 8))
+        ).grid(row=2, column=0, columnspan=4, sticky="w", padx=12, pady=(2, 8))
 
-        def apply():
-            new_name = name_var.get().strip() or self.default_channel_name(ch_idx)
-            new_color = color_var.get()
-            self.channel_names[ch_idx] = new_name
-            self.channel_colors[ch_idx] = new_color
-            self.set_channel_recording(ch_idx, bool(record_var.get()))
-            tag = "ch_color_{0}".format(ch_idx)
-            self.tree.tag_configure(tag, foreground=new_color)
-            self.update_channel_tree_row(ch_idx)
-            self.lines[ch_idx].set_label(new_name)
-            self.lines[ch_idx].set_color(new_color)
-            self.refresh_legend()
-            self.canvas.draw_idle()
+        note_text = None
+        if is_satellite_channel:
+            if node_id is None:
+                note_text = "Save/Close updates the app only. Connect the ESP controller to enable Send to satellite."
+            else:
+                note_text = (
+                    "Save/Close updates the app only. Send to satellite uses letters, numbers, space, _ or -, "
+                    "up to {0} characters.".format(self.SATELLITE_NAME_MAX_LEN)
+                )
+        if note_text:
+            tk.Label(
+                dialog,
+                text=note_text,
+                justify="left",
+                wraplength=390,
+                fg="#4c566a",
+                font=("Segoe UI", 9),
+            ).grid(row=3, column=0, columnspan=4, sticky="w", padx=12, pady=(0, 8))
+
+        def apply_local_name():
+            return self.apply_channel_editor_changes(
+                ch_idx,
+                name_var.get(),
+                color_var.get(),
+                bool(record_var.get()),
+            )
+
+        def save_only():
+            apply_local_name()
+
+        def close_and_apply():
+            apply_local_name()
+            dialog.destroy()
+
+        def send_to_satellite():
+            requested_name = name_var.get()
+            sent, applied_name = self.send_satellite_rename(ch_idx, requested_name, parent=dialog)
+            if not sent:
+                return
+            if applied_name is not None:
+                if applied_name != requested_name.strip():
+                    messagebox.showinfo(
+                        "Send to Satellite",
+                        'Satellite name was adjusted to "{0}" to match firmware limits.'.format(applied_name),
+                        parent=dialog,
+                    )
+                name_var.set(applied_name)
+            apply_local_name()
             dialog.destroy()
 
         btn_row = tk.Frame(dialog)
-        btn_row.grid(row=3, column=0, columnspan=3, pady=(4, 12))
-        tk.Button(btn_row, text="Apply", command=apply, bg="#4a90d9", fg="white",
-                  font=("Segoe UI", 10), padx=18).pack(side=tk.LEFT, padx=8)
-        tk.Button(btn_row, text="Cancel", command=dialog.destroy,
-                  font=("Segoe UI", 10), padx=18).pack(side=tk.LEFT)
-        dialog.bind("<Return>", lambda e: apply())
+        btn_row.grid(row=4, column=0, columnspan=4, pady=(6, 12))
+        tk.Button(
+            btn_row,
+            text="Save",
+            command=save_only,
+            bg="#4a90d9",
+            fg="white",
+            font=("Segoe UI", 10),
+            padx=18,
+        ).pack(side=tk.LEFT, padx=6)
+        if is_satellite_channel:
+            send_btn = tk.Button(
+                btn_row,
+                text="Send to satellite",
+                command=send_to_satellite,
+                font=("Segoe UI", 10),
+                padx=12,
+            )
+            if node_id is None or not self.source_connected["esp"]:
+                send_btn.config(state=tk.DISABLED)
+            send_btn.pack(side=tk.LEFT, padx=6)
+        tk.Button(
+            btn_row,
+            text="Close",
+            command=close_and_apply,
+            font=("Segoe UI", 10),
+            padx=18,
+        ).pack(side=tk.LEFT, padx=6)
+        tk.Button(
+            btn_row,
+            text="Cancel",
+            command=dialog.destroy,
+            font=("Segoe UI", 10),
+            padx=18,
+        ).pack(side=tk.LEFT, padx=6)
+        dialog.bind("<Return>", lambda e: save_only())
+        dialog.protocol("WM_DELETE_WINDOW", close_and_apply)
         dialog.wait_window()
 
     # â”€â”€ Markers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1988,8 +3088,10 @@ class ArduinoLoggerApp:
 
     _DRAG_THRESHOLD = 4   # pixels of movement before drag activates
 
-    def _on_mouse_press(self, event):
+    def _on_mouse_press(self, event, graph_kind=None):
         """Handle both drag-start (left-click) and double-click (marker actions)."""
+        if graph_kind is not None:
+            self.set_active_graph(graph_kind)
         if event.inaxes != self.ax:
             return
 
@@ -2000,8 +3102,10 @@ class ArduinoLoggerApp:
             PIXEL_HIT = 9
             for idx, marker in enumerate(self.markers):
                 try:
-                    mx = self.ax.transData.transform(
-                        (mdates.date2num(marker["datetime"]), 0))[0]
+                    artists = marker.get("artists", {}).get(self.active_graph_kind)
+                    if not artists:
+                        continue
+                    mx = self.ax.transData.transform((mdates.date2num(marker["datetime"]), 0))[0]
                     if abs(event.x - mx) <= PIXEL_HIT:
                         self.edit_marker(idx)
                         return
@@ -2021,10 +3125,14 @@ class ArduinoLoggerApp:
             # stays consistent even as we shift xlim/ylim during the drag.
             self._drag_inv_tf = self.ax.transData.inverted()
             self._is_dragging = False
+            self._drag_graph_kind = self.active_graph_kind
             self.canvas.get_tk_widget().config(cursor="fleur")
 
-    def _on_mouse_drag(self, event):
+    def _on_mouse_drag(self, event, graph_kind=None):
         """Pan the axes while the left button is held and moved."""
+        if graph_kind is not None:
+            self.set_active_graph(graph_kind)
+            self._update_legend_hover_state(event, graph_kind)
         if self._drag_press_x is None:
             return
         if self.toolbar.mode != "":
@@ -2054,14 +3162,19 @@ class ArduinoLoggerApp:
         self.ax.set_ylim(self._drag_ylim[0] - dy, self._drag_ylim[1] - dy)
         self.canvas.draw_idle()
 
-    def _on_mouse_release(self, event):
+    def _on_mouse_release(self, event, graph_kind=None):
         """End drag."""
+        if graph_kind is not None:
+            self.set_active_graph(graph_kind)
         if self._drag_press_x is not None:
             self.canvas.get_tk_widget().config(cursor="")
         self._cancel_drag()
 
-    def _on_mouse_wheel(self, event):
+    def _on_mouse_wheel(self, event, graph_kind=None):
         """Zoom with mouse wheel in the graph area."""
+        if graph_kind is not None:
+            self.set_active_graph(graph_kind)
+            self._update_legend_hover_state(event, graph_kind)
         if event.inaxes != self.ax:
             return
         if self.toolbar.mode != "":
@@ -2080,6 +3193,10 @@ class ArduinoLoggerApp:
         self._drag_ylim = None
         self._drag_inv_tf = None
         self._is_dragging = False
+        self._drag_graph_kind = None
+
+    def _on_graph_leave(self, graph_kind):
+        self._set_legend_expanded(graph_kind, False)
 
     def _prompt_and_place_marker(self, dt):
         note = simpledialog.askstring(
@@ -2093,22 +3210,26 @@ class ArduinoLoggerApp:
         self._place_marker(dt, note, save_to_db=True)
 
     def _place_marker(self, dt, note, save_to_db=True):
-        vline = self.ax.axvline(x=dt, color="crimson", linestyle="--",
-                                linewidth=1.4, alpha=0.85, zorder=5)
-        annotation = self.ax.annotate(
-            note,
-            xy=(dt, 1.0),
-            xycoords=("data", "axes fraction"),
-            xytext=(3, -4), textcoords="offset points",
-            fontsize=7, color="crimson",
-            rotation=90, va="top", ha="left",
-            clip_on=False, zorder=6
-        )
-        self.markers.append({"datetime": dt, "note": note, "vline": vline, "annotation": annotation})
+        artists = {}
+        for kind, ctx in self.graph_contexts.items():
+            vline = ctx["ax"].axvline(x=dt, color="crimson", linestyle="--",
+                                      linewidth=1.4, alpha=0.85, zorder=5)
+            annotation = ctx["ax"].annotate(
+                note,
+                xy=(dt, 1.0),
+                xycoords=("data", "axes fraction"),
+                xytext=(3, -4), textcoords="offset points",
+                fontsize=7, color="crimson",
+                rotation=90, va="top", ha="left",
+                clip_on=False, zorder=6
+            )
+            artists[kind] = {"vline": vline, "annotation": annotation}
+        self.markers.append({"datetime": dt, "note": note, "artists": artists})
         self._rebuild_listbox()
         if save_to_db:
             self._save_marker_to_db("ADD", dt, note)
-        self.canvas.draw_idle()
+        for ctx in self.graph_contexts.values():
+            ctx["canvas"].draw_idle()
 
     def edit_marker(self, idx):
         marker = self.markers[idx]
@@ -2122,49 +3243,75 @@ class ArduinoLoggerApp:
             return
         new_note = new_note.strip() or "(no note)"
         marker["note"] = new_note
-        marker["annotation"].set_text(new_note)
+        for artists in marker.get("artists", {}).values():
+            artists["annotation"].set_text(new_note)
         self._rebuild_listbox()
         self._save_marker_to_db("EDIT", marker["datetime"], new_note)
-        self.canvas.draw_idle()
+        for ctx in self.graph_contexts.values():
+            ctx["canvas"].draw_idle()
 
-    def on_listbox_double_click(self, event):
-        sel = self.markers_listbox.curselection()
+    def on_listbox_double_click(self, event, graph_kind=None, source_listbox=None):
+        if graph_kind is not None:
+            self.set_active_graph(graph_kind)
+        listbox = source_listbox or self.markers_listbox
+        sel = listbox.curselection()
         if not sel:
             return
         marker_idx = sel[0] // 3
         if marker_idx < len(self.markers):
             self.edit_marker(marker_idx)
 
-    def delete_marker(self):
-        sel = self.markers_listbox.curselection()
+    def delete_marker(self, graph_kind=None, source_listbox=None):
+        if graph_kind is not None:
+            self.set_active_graph(graph_kind)
+        listbox = source_listbox or self.markers_listbox
+        sel = listbox.curselection()
         if not sel:
             return
         marker_idx = sel[0] // 3
         if marker_idx >= len(self.markers):
             return
         marker = self.markers[marker_idx]
-        try:
-            marker["vline"].remove()
-        except Exception:
-            pass
-        try:
-            marker["annotation"].remove()
-        except Exception:
-            pass
+        for artists in marker.get("artists", {}).values():
+            try:
+                artists["vline"].remove()
+            except Exception:
+                pass
+            try:
+                artists["annotation"].remove()
+            except Exception:
+                pass
         self._save_marker_to_db("DEL", marker["datetime"], marker["note"])
         self.markers.pop(marker_idx)
         self._rebuild_listbox()
-        self.canvas.draw_idle()
+        for ctx in self.graph_contexts.values():
+            ctx["canvas"].draw_idle()
 
     def _rebuild_listbox(self):
-        self.markers_listbox.delete(0, tk.END)
-        for marker in self.markers:
-            ts = marker["datetime"].strftime("%Y-%m-%d %H:%M:%S")
-            self.markers_listbox.insert(tk.END, u"\u25cf {0}".format(ts))
-            self.markers_listbox.insert(tk.END, "  {0}".format(marker["note"]))
-            self.markers_listbox.insert(tk.END, "")
-        if self.markers:
-            self.markers_listbox.see(tk.END)
+        for ctx in self.graph_contexts.values():
+            listbox = ctx["markers_listbox"]
+            listbox.delete(0, tk.END)
+            for marker in self.markers:
+                ts = marker["datetime"].strftime("%Y-%m-%d %H:%M:%S")
+                listbox.insert(tk.END, u"\u25cf {0}".format(ts))
+                listbox.insert(tk.END, "  {0}".format(marker["note"]))
+                listbox.insert(tk.END, "")
+            if self.markers:
+                listbox.see(tk.END)
+            self._refresh_listbox_scrollbar(listbox, ctx.get("markers_scrollbar"))
+        if self.floating_markers_listbox is not None:
+            self.floating_markers_listbox.delete(0, tk.END)
+            for marker in self.markers:
+                ts = marker["datetime"].strftime("%Y-%m-%d %H:%M:%S")
+                self.floating_markers_listbox.insert(tk.END, u"\u25cf {0}".format(ts))
+                self.floating_markers_listbox.insert(tk.END, "  {0}".format(marker["note"]))
+                self.floating_markers_listbox.insert(tk.END, "")
+            if self.markers:
+                self.floating_markers_listbox.see(tk.END)
+            self._refresh_listbox_scrollbar(
+                self.floating_markers_listbox,
+                self.floating_markers_scrollbar
+            )
 
     def refresh_ports(self):
         ports = [p.device for p in serial.tools.list_ports.comports()]
@@ -2212,6 +3359,7 @@ class ArduinoLoggerApp:
         if self.source_connected[other_kind] and port_name == self.get_source_port_name(other_kind):
             messagebox.showwarning("Port", "That COM port is already used by the other source.")
             return
+        session_already_active = self.any_source_connected() and self.db_session_id is not None
 
         baud_rate = self.ARDUINO_BAUD_RATE if source_kind == "arduino" else self.ESP_BAUD_RATE
         try:
@@ -2230,7 +3378,7 @@ class ArduinoLoggerApp:
         if not self.any_source_connected():
             self.start_db_session()
             self.loaded_session_id = None
-            self.ax.set_title("", loc="left")
+            self.refresh_graph_titles()
             self.refresh_sessions_list()
 
         self.serial_ports[source_kind] = ser
@@ -2245,11 +3393,20 @@ class ArduinoLoggerApp:
         else:
             self.esp_init_attempts_remaining = 6
             self.esp_stream_confirmed = False
+            self.esp_time_synced = False
             self.btn_connect_esp.config(text="Stop ESP")
             self.append_console(">>> ESP controller connected on {0} (session #{1})".format(port_name, self.db_session_id))
 
+        if session_already_active:
+            if source_kind == "arduino":
+                self.add_auto_marker("Arduino connected on {0}".format(port_name))
+            else:
+                self.add_auto_marker("ESP connected on {0}".format(port_name))
+
         self.update_status_label()
         self.update_sessions_controls()
+        self.rebuild_channel_tree()
+        self._schedule_redraw()
         self.read_threads[source_kind] = threading.Thread(
             target=self.serial_read_loop, args=(source_kind,), daemon=True
         )
@@ -2296,6 +3453,17 @@ class ArduinoLoggerApp:
             return True
         return False
 
+    def sync_esp_time(self, log_to_console=True):
+        if not self.source_connected["esp"]:
+            return False
+        unix_time = int(time.time())
+        if self.send_esp_command("TIME SET {0}".format(unix_time)):
+            self.esp_time_synced = True
+            if log_to_console:
+                self.append_console(">>> [ESP] TIME SET {0}".format(unix_time))
+            return True
+        return False
+
     def on_interval_changed(self, event=None):
         interval_text = self.txt_interval.get().strip()
         interval_ms = self.parse_interval_ms(interval_text)
@@ -2325,7 +3493,6 @@ class ArduinoLoggerApp:
         interval_ms = self.current_interval_ms()
         for cmd in (
             "STREAM ON",
-            "TIME SET {0}".format(int(time.time())),
             "SETINT ALL {0}".format(interval_ms),
             "NODES",
         ):
@@ -2335,7 +3502,7 @@ class ArduinoLoggerApp:
                 self.append_console("ESP init error: {0}".format(ex))
                 break
         self.append_console(
-            ">>> [ESP] init attempt {0}: STREAM ON / TIME SET / SETINT ALL {1} / NODES".format(
+            ">>> [ESP] init attempt {0}: STREAM ON / SETINT ALL {1} / NODES".format(
                 attempt_no, interval_ms
             )
         )
@@ -2377,12 +3544,6 @@ class ArduinoLoggerApp:
 
     def handle_incoming_chunk(self, source_kind, chunk):
         self.receive_buffers[source_kind] += chunk
-        if source_kind == "arduino" and not self.arduino_polling_started and self.HANDSHAKE_MARKER in self.receive_buffers[source_kind]:
-            interval_ms = self.current_interval_ms()
-            self.arduino_polling_started = True
-            self.append_console(">>> [ARD] Polling started")
-            self.update_status_label()
-            self.schedule_arduino_poll(interval_ms)
         self.process_receive_buffer(source_kind)
 
     def process_receive_buffer(self, source_kind):
@@ -2462,32 +3623,124 @@ class ArduinoLoggerApp:
             self.process_esp_packet_line(line)
 
     def process_arduino_packet_line(self, line):
-        matches = list(self.PACKET_REGEX.finditer(line))
-        if not matches:
+        json_start = line.find("{")
+        if json_start < 0:
             return
+        try:
+            event = json.loads(line[json_start:])
+        except Exception:
+            return
+        event_name = str(event.get("event", "") or "")
+        if event_name == "arduino_ready":
+            board = str(event.get("board", "") or "").strip()
+            fw_version = str(event.get("fw_version", "") or "").strip()
+            protocol = str(event.get("protocol", "") or "").strip()
+            channel_count = event.get("channel_count")
+            try:
+                channel_count = int(channel_count) if channel_count is not None else None
+            except Exception:
+                channel_count = None
+            self.arduino_info = {
+                "board": board,
+                "fw_version": fw_version,
+                "protocol": protocol,
+                "channel_count": channel_count,
+            }
+            board_label = self.format_board_name(board)
+            details = [board_label]
+            if fw_version:
+                details.append("fw {0}".format(fw_version))
+            if protocol:
+                details.append("protocol {0}".format(protocol))
+            if channel_count is not None:
+                details.append("{0} channels".format(channel_count))
+            self.append_console(">>> [ARD] Ready: {0}".format(", ".join(details)))
+            if channel_count is not None and channel_count != self.ARDUINO_CHANNEL_COUNT:
+                self.append_console(
+                    "[ARD] Channel count mismatch: app expects {0}, device reports {1}".format(
+                        self.ARDUINO_CHANNEL_COUNT, channel_count
+                    )
+                )
+            if not self.arduino_polling_started:
+                interval_ms = self.current_interval_ms()
+                self.arduino_polling_started = True
+                self.append_console(">>> [ARD] Polling started")
+                self.update_status_label()
+                self.schedule_arduino_poll(interval_ms)
+            else:
+                self.update_status_label()
+            return
+        if event_name != "arduino_batch":
+            return
+
         now = datetime.now()
+        status = str(event.get("status", "") or "").strip().lower()
+        message = str(event.get("message", "") or "").strip()
+        items = event.get("items", [])
+        if not isinstance(items, list):
+            return
+
         got_any = False
-        for match in matches:
-            channel_idx = int(match.group(1))
-            if not (0 <= channel_idx < self.ARDUINO_CHANNEL_COUNT):
+        batch_errors = []
+        for item in items:
+            if not isinstance(item, dict):
                 continue
             try:
-                temp_raw = float(match.group(2))
-                hum_raw = float(match.group(3))
-            except ValueError:
+                channel_idx = int(item.get("channel"))
+            except Exception:
                 continue
+            if not (0 <= channel_idx < self.ARDUINO_CHANNEL_COUNT):
+                continue
+
+            if not bool(item.get("sensor_ok")):
+                self.current_temps[channel_idx] = "NaN"
+                self.current_hums[channel_idx] = "NaN"
+                self.update_channel_tree_row(channel_idx, "-", "-", self.current_signals[channel_idx])
+                error_text = str(item.get("error", "") or "").strip()
+                if error_text:
+                    batch_errors.append("CH{0}: {1}".format(channel_idx, error_text))
+                continue
+
+            try:
+                temp_raw = float(item.get("temperature_c"))
+                hum_raw = float(item.get("humidity_pct"))
+            except Exception:
+                continue
+
             temp_cal = self.apply_calibration("temp", channel_idx, temp_raw)
             hum_cal = self.apply_calibration("hum", channel_idx, hum_raw)
             temp_text = self._format_number(temp_cal)
             hum_text = self._format_number(hum_cal)
             self.current_temps[channel_idx] = temp_text
             self.current_hums[channel_idx] = hum_text
-            self.update_channel_tree_row(channel_idx, "{0} \u00b0C".format(temp_text), "{0} %".format(hum_text))
-            self.add_smoothed_point(channel_idx, now, temp_cal)
+            self.update_channel_tree_row(
+                channel_idx,
+                "{0} \u00b0C".format(temp_text),
+                "{0} %".format(hum_text),
+                self.current_signals[channel_idx]
+            )
+            self.add_smoothed_point(channel_idx, now, temp_cal, hum_cal)
             got_any = True
+
+        if status == "no_sensors":
+            for channel_idx in range(self.ARDUINO_CHANNEL_COUNT):
+                self.current_temps[channel_idx] = "NaN"
+                self.current_hums[channel_idx] = "NaN"
+                self.update_channel_tree_row(channel_idx, "-", "-", self.current_signals[channel_idx])
+        elif status and status != "ok":
+            status_text = "[ARD] Batch status: {0}".format(status)
+            if message:
+                status_text = "{0} ({1})".format(status_text, message)
+            self.append_console(status_text)
+
+        if batch_errors:
+            self.append_console("[ARD] Read errors: {0}".format("; ".join(batch_errors)))
+
         if got_any:
             self.save_to_db(now)
             self._schedule_redraw()
+        else:
+            self.refresh_legend()
 
     def parse_esp_timestamp(self, event):
         iso_text = str(event.get("controller_time", "") or "").strip()
@@ -2512,9 +3765,10 @@ class ArduinoLoggerApp:
         if (not current_name) or current_name.startswith("ESP Slot") or current_name.startswith("ESP Node"):
             safe_name = (node_name or "satellite").strip()
             self.channel_names[slot_idx] = "ESP Node {0} - {1}".format(node_id, safe_name)
-            self.lines[slot_idx].set_label(self.channel_names[slot_idx])
+            for ctx in self.graph_contexts.values():
+                ctx["lines"][slot_idx].set_label(self.channel_names[slot_idx])
             self.refresh_legend()
-        self.update_channel_tree_row(slot_idx)
+        self.update_channel_tree_row(slot_idx, signal_display=self.current_signals[slot_idx])
 
     def process_esp_packet_line(self, line):
         json_start = line.find("{")
@@ -2537,6 +3791,8 @@ class ArduinoLoggerApp:
                 except Exception:
                     pass
                 self.esp_init_job = None
+            if not self.esp_time_synced:
+                self.sync_esp_time(log_to_console=True)
             try:
                 node_id = int(event.get("node_id"))
                 temp_raw = float(event.get("temperature_c"))
@@ -2547,17 +3803,56 @@ class ArduinoLoggerApp:
             if slot_idx is None:
                 return
             self.update_esp_slot_metadata(slot_idx, node_id, str(event.get("name", "") or "satellite"))
+            signal_pct = event.get("signal_pct")
+            rssi_dbm = event.get("rssi_dbm")
+            self.current_signals[slot_idx] = self.format_signal_display(signal_pct, rssi_dbm)
+            state = self.esp_node_state.setdefault(node_id, {})
+            state["slot_idx"] = slot_idx
+            state["name"] = str(event.get("name", "") or "satellite")
+            state["signal_pct"] = signal_pct
+            state["rssi_dbm"] = rssi_dbm
             temp_cal = self.apply_calibration("temp", slot_idx, temp_raw)
             hum_cal = self.apply_calibration("hum", slot_idx, hum_raw)
             temp_text = self._format_number(temp_cal)
             hum_text = self._format_number(hum_cal)
             self.current_temps[slot_idx] = temp_text
             self.current_hums[slot_idx] = hum_text
-            self.update_channel_tree_row(slot_idx, "{0} \u00b0C".format(temp_text), "{0} %".format(hum_text))
             now = self.parse_esp_timestamp(event)
-            self.add_smoothed_point(slot_idx, now, temp_cal)
+            state["last_seen_monotonic"] = time.monotonic()
+            state["last_seen_dt"] = now
+            self.update_esp_node_presence(node_id, True, dt=now)
+            self.update_channel_tree_row(
+                slot_idx,
+                "{0} \u00b0C".format(temp_text),
+                "{0} %".format(hum_text),
+                self.current_signals[slot_idx]
+            )
+            self.add_smoothed_point(slot_idx, now, temp_cal, hum_cal)
             self.save_to_db(now)
             self._schedule_redraw()
+        elif event_name == "rename_ack":
+            try:
+                node_id = int(event.get("node_id"))
+            except Exception:
+                return
+            node_name = str(event.get("name", "") or "satellite")
+            applied = bool(event.get("applied"))
+            slot_idx = self.allocate_esp_slot(node_id)
+            state = self.esp_node_state.setdefault(node_id, {})
+            state["name"] = node_name
+            if slot_idx is not None:
+                state["slot_idx"] = slot_idx
+                if applied:
+                    self.channel_names[slot_idx] = node_name
+                    self.update_channel_tree_row(slot_idx, signal_display=self.current_signals[slot_idx])
+                    for ctx in self.graph_contexts.values():
+                        ctx["lines"][slot_idx].set_label(node_name)
+                        ctx["canvas"].draw_idle()
+                    self.refresh_legend()
+                else:
+                    self.update_channel_tree_row(slot_idx, signal_display=self.current_signals[slot_idx])
+            if applied and self.source_connected["esp"]:
+                self.send_esp_command("NODES")
         elif event_name == "nodes":
             self.esp_stream_confirmed = True
             if self.esp_init_job is not None:
@@ -2566,6 +3861,9 @@ class ArduinoLoggerApp:
                 except Exception:
                     pass
                 self.esp_init_job = None
+            if not self.esp_time_synced:
+                self.sync_esp_time(log_to_console=True)
+            updated_any = False
             for item in event.get("items", []):
                 try:
                     node_id = int(item.get("node_id"))
@@ -2574,7 +3872,33 @@ class ArduinoLoggerApp:
                 slot_idx = self.allocate_esp_slot(node_id)
                 if slot_idx is None:
                     continue
-                self.update_esp_slot_metadata(slot_idx, node_id, str(item.get("name", "") or "satellite"))
+                node_name = str(item.get("name", "") or "satellite")
+                self.update_esp_slot_metadata(slot_idx, node_id, node_name)
+                signal_pct = item.get("signal_pct")
+                rssi_dbm = item.get("rssi_dbm")
+                self.current_signals[slot_idx] = self.format_signal_display(signal_pct, rssi_dbm)
+                state = self.esp_node_state.setdefault(node_id, {})
+                state["slot_idx"] = slot_idx
+                state["name"] = node_name
+                state["signal_pct"] = signal_pct
+                state["rssi_dbm"] = rssi_dbm
+                try:
+                    state["report_interval_ms"] = max(250, int(item.get("report_interval_ms")))
+                except Exception:
+                    state["report_interval_ms"] = state.get("report_interval_ms", 1000) or 1000
+                try:
+                    last_seen_ms = int(item.get("last_seen_ms"))
+                except Exception:
+                    last_seen_ms = None
+                if last_seen_ms is not None:
+                    state["last_seen_monotonic"] = time.monotonic() - max(0.0, last_seen_ms / 1000.0)
+                    state["last_seen_dt"] = datetime.now()
+                    stale_after_ms = max(5000, state["report_interval_ms"] * 3)
+                    self.update_esp_node_presence(node_id, last_seen_ms <= stale_after_ms, dt=datetime.now())
+                self.update_channel_tree_row(slot_idx, signal_display=self.current_signals[slot_idx])
+                updated_any = True
+            if updated_any:
+                self.refresh_legend()
 
     def schedule_arduino_poll(self, interval_ms):
         if self.arduino_poll_job is not None:
@@ -2587,16 +3911,23 @@ class ArduinoLoggerApp:
         ser = self.serial_ports.get("arduino")
         if ser and ser.is_open and self.source_connected["arduino"]:
             try:
-                ser.write(b"Read\n")
+                ser.write(b"READ\n")
             except Exception:
                 pass
             interval_ms = self.current_interval_ms()
             self.schedule_arduino_poll(interval_ms)
 
-    def add_smoothed_point(self, channel_index, timestamp, raw_value):
-        history = self.temp_history[channel_index]
-        history.append(raw_value)
-        smoothed = sum(history) / float(len(history))
+    def add_smoothed_point(self, channel_index, timestamp, temp_raw=None, hum_raw=None):
+        temp_smoothed = None
+        hum_smoothed = None
+        if temp_raw is not None:
+            temp_history = self.temp_history[channel_index]
+            temp_history.append(temp_raw)
+            temp_smoothed = sum(temp_history) / float(len(temp_history))
+        if hum_raw is not None:
+            hum_history = self.hum_history[channel_index]
+            hum_history.append(hum_raw)
+            hum_smoothed = sum(hum_history) / float(len(hum_history))
 
         # Keep at most one plotted point per second per channel so 1 week is bounded.
         ts_sec = int(timestamp.timestamp())
@@ -2604,10 +3935,18 @@ class ArduinoLoggerApp:
 
         if self.last_plot_second[channel_index] == ts_sec and self.series_times[channel_index]:
             self.series_times[channel_index][-1] = ts_plot
-            self.series_values[channel_index][-1] = smoothed
+            if temp_smoothed is not None:
+                self.temp_series_values[channel_index][-1] = temp_smoothed
+            if hum_smoothed is not None:
+                self.hum_series_values[channel_index][-1] = hum_smoothed
         else:
             self.series_times[channel_index].append(ts_plot)
-            self.series_values[channel_index].append(smoothed)
+            self.temp_series_values[channel_index].append(
+                temp_smoothed if temp_smoothed is not None else math.nan
+            )
+            self.hum_series_values[channel_index].append(
+                hum_smoothed if hum_smoothed is not None else math.nan
+            )
             self.last_plot_second[channel_index] = ts_sec
 
     def _schedule_redraw(self):
@@ -2620,30 +3959,41 @@ class ArduinoLoggerApp:
         self._redraw_pending = False
         self.redraw_graph()
 
-    def redraw_graph(self):
-        any_points = False
+    def redraw_graph(self, graph_kind=None):
+        graph_kinds = [graph_kind] if graph_kind else list(self.graph_contexts.keys())
         visible_channels = set(self.visible_channel_indices())
-        for i in range(self.CHANNEL_COUNT):
-            times = list(self.series_times[i])
-            vals  = list(self.series_values[i])
-            if len(times) > self.MAX_RENDER_POINTS:
-                step = int(math.ceil(len(times) / float(self.MAX_RENDER_POINTS)))
-                times = times[::step]
-                vals = vals[::step]
-            self.lines[i].set_data(times, vals)
-            self.lines[i].set_visible(self.channel_record_enabled[i] and i in visible_channels)
-            if times and self.channel_record_enabled[i] and i in visible_channels:
-                any_points = True
+        previous_active_kind = self.active_graph_kind
+        for kind in graph_kinds:
+            ctx = self.graph_contexts.get(kind)
+            if ctx is None:
+                continue
+            series_values = self.series_values_for_kind(kind)
+            any_points = False
+            for i in range(self.CHANNEL_COUNT):
+                times = list(self.series_times[i])
+                vals = list(series_values[i])
+                if len(times) > self.MAX_RENDER_POINTS:
+                    step = int(math.ceil(len(times) / float(self.MAX_RENDER_POINTS)))
+                    times = times[::step]
+                    vals = vals[::step]
+                ctx["lines"][i].set_data(times, vals)
+                ctx["lines"][i].set_visible(self.channel_record_enabled[i] and i in visible_channels)
+                if times and self.channel_record_enabled[i] and i in visible_channels:
+                    any_points = True
 
-        if any_points and self._auto_view:
-            self._ignore_xlim_changes += 1
-            self._in_redraw = True
-            self.ax.relim()
-            self.ax.autoscale_view()
-            self._in_redraw = False
-            self._update_scrollbar()
+            if any_points and self._auto_view:
+                self._ignore_xlim_changes += 1
+                self._in_redraw = True
+                ctx["ax"].relim()
+                ctx["ax"].autoscale_view()
+                self._in_redraw = False
+                if kind == self.active_graph_kind:
+                    self._update_scrollbar(kind)
 
-        self.canvas.draw_idle()
+            self.refresh_legend(kind)
+            ctx["canvas"].draw_idle()
+        if previous_active_kind in self.graph_contexts:
+            self.set_active_graph(previous_active_kind)
 
     def schedule_poll(self, interval_ms):
         self.schedule_arduino_poll(interval_ms)
@@ -2659,14 +4009,21 @@ class ArduinoLoggerApp:
                 pass
             self.arduino_poll_job = None
             self.arduino_polling_started = False
-        if source_kind == "esp" and self.esp_init_job is not None:
-            try:
-                self.root.after_cancel(self.esp_init_job)
-            except Exception:
-                pass
-            self.esp_init_job = None
+            self.arduino_info = {"board": "", "fw_version": "", "protocol": "", "channel_count": None}
+        if source_kind == "esp":
+            if self.esp_init_job is not None:
+                try:
+                    self.root.after_cancel(self.esp_init_job)
+                except Exception:
+                    pass
+                self.esp_init_job = None
             self.esp_init_attempts_remaining = 0
             self.esp_stream_confirmed = False
+            self.esp_time_synced = False
+            self.esp_node_state.clear()
+            for slot_idx in range(self.ARDUINO_CHANNEL_COUNT, self.CHANNEL_COUNT):
+                self.current_signals[slot_idx] = "-"
+                self.update_channel_tree_row(slot_idx, signal_display="-")
 
         self.stop_events[source_kind].set()
         ser = self.serial_ports.get(source_kind)
@@ -2696,6 +4053,8 @@ class ArduinoLoggerApp:
             self.refresh_sessions_list()
         self.update_status_label()
         self.update_sessions_controls()
+        self.rebuild_channel_tree()
+        self._schedule_redraw()
 
     def close_connection(self, source_kind=None):
         if source_kind is None:
@@ -2733,6 +4092,13 @@ class ArduinoLoggerApp:
 
     def on_close(self):
         self.save_config()
+        if self.esp_presence_job is not None:
+            try:
+                self.root.after_cancel(self.esp_presence_job)
+            except Exception:
+                pass
+            self.esp_presence_job = None
+        self._destroy_floating_markers_window()
         self._destroy_floating_terminal_window()
         self.close_connection()
         if self.db_conn:

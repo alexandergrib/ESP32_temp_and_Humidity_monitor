@@ -79,7 +79,8 @@ if (Test-Path $tkDir)  { $env:TK_LIBRARY  = $tkDir }
 & $pythonExe -m PyInstaller `
     --noconfirm `
     --clean `
-    --onefile `
+    --onedir `
+    --contents-directory "libraries" `
     --windowed `
     --noupx `
     --name "TempHumidityLogger" `
@@ -102,4 +103,6 @@ if (Test-Path $tkDir)  { $env:TK_LIBRARY  = $tkDir }
 
 Write-Host ""
 Write-Host "Build complete:"
-Write-Host "  $projectRoot\dist\TempHumidityLogger.exe"
+Write-Host "  $projectRoot\dist\TempHumidityLogger\TempHumidityLogger.exe"
+Write-Host "Libraries:"
+Write-Host "  $projectRoot\dist\TempHumidityLogger\libraries"

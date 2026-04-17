@@ -1,5 +1,12 @@
 .venv
+venv
 old C-sharm
+__pycache__/
+build/
+dist/TempHumidityLogger/
 log*
 data.csv
+data*_temperature.csv
+data*_humidity.csv
 logger.*
+logger.db*
