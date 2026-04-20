@@ -18,6 +18,7 @@ static constexpr uint8_t PIN_I2C_SCL = 22;
 static constexpr char DEFAULT_NODE_NAME[] = "satellite";
 static constexpr uint8_t FW_VERSION_MAJOR = 2;
 static constexpr uint8_t FW_VERSION_MINOR = 5;
+static constexpr uint32_t SATELLITE_CPU_FREQ_MHZ = 80;
 
 #ifndef LED_BUILTIN
 static constexpr uint8_t STATUS_LED_PIN = 2;
@@ -695,8 +696,14 @@ void onDataSent(const uint8_t*, esp_now_send_status_t status) {
 #endif
 
 void setup() {
+    const bool cpuFreqApplied = setCpuFrequencyMhz(SATELLITE_CPU_FREQ_MHZ);
     Serial.begin(SERIAL_BAUD);
     delay(500);
+    Serial.printf(
+        "Satellite CPU frequency: %u MHz%s\n",
+        static_cast<unsigned>(getCpuFrequencyMhz()),
+        cpuFreqApplied ? "" : " (requested change failed)"
+    );
     initStatusLed();
 
     loadConfig();

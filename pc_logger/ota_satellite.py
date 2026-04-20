@@ -154,7 +154,12 @@ def wait_for_node_ready(ser: serial.Serial, node_id: int, timeout: float) -> dic
 
 def wait_for_nodes_snapshot(ser: serial.Serial, timeout: float) -> list[dict]:
     deadline = time.time() + timeout
+    next_probe_at = 0.0
     while time.time() < deadline:
+        now = time.time()
+        if now >= next_probe_at:
+            send_command(ser, "NODES")
+            next_probe_at = now + 1.0
         remaining = max(0.1, deadline - time.time())
         event = read_event(ser, remaining)
         if event is None:
@@ -187,12 +192,11 @@ def main() -> int:
     with serial.Serial(args.port, args.baud, timeout=0.5) as ser:
         ser.dtr = False
         ser.rts = False
-        time.sleep(0.2)
+        time.sleep(0.5)
         ser.reset_input_buffer()
         send_command(ser, "STREAM ON")
         read_event(ser, 2.0)
-        send_command(ser, "NODES")
-        snapshot = wait_for_nodes_snapshot(ser, 4.0)
+        snapshot = wait_for_nodes_snapshot(ser, 8.0)
         saved_intervals: dict[int, int] = {}
         for item in snapshot:
             node_id = int(item.get("node_id", 0))

@@ -1,89 +1,88 @@
 # ESP32 Temperature Monitor
 
-ESP32 controller + one or more ESP32 satellites with SHT85 sensors.
+ESP32 controller and satellite firmware with PC-side tools for logging, graphing, terminal control, and OTA updates.
 
-- Controller talks to the PC over USB serial.
-- Satellites talk to the controller over ESP-NOW on channel `6`.
-- Satellites only send readings when the controller requests them.
-- Satellite OTA is performed through the controller.
+## Overview
 
-#wiring
-```text
-SHT85 - ESP32
-1 WHITE SCL -> P22
-2 RED VCC -> 3v3
-3 BLACK GND - GND
-4 GREEN SDA -> P21
-```
-```text
-+--------------------+       USB Serial       +-------------------------+
-|      Computer      | <--------------------> |    ESP32 Controller     |
-| logger / GUI / CLI |                        |  JSON lines over USB    |
-+--------------------+                        +------------+------------+
-                                                          |
-                                                  ESP-NOW |
-                                                          |
-               +------------------------------------------+----------------------------------+
-               |                                          |                                  |
-               v                                          v                                  v
-      +-------------------+                     +-------------------+               +-------------------+
-      | ESP32 Satellite 1 |                     | ESP32 Satellite 2 |               | ESP32 Satellite N |
-      | + 1 x SHT85       |                     | + 1 x SHT85       |               | + 1 x SHT85       |
-      +-------------------+                     +-------------------+               +-------------------+
-```
+The system is split into three parts:
+
+- An ESP32 controller connected to the PC over USB serial
+- One or more ESP32 satellite nodes with SHT85 sensors
+- Python tools for live logging, charts, terminal control, and satellite OTA
+
+Satellites communicate with the controller over ESP-NOW on channel `6`. The controller polls satellites and returns JSON events to the PC.
 
 ## Repository Layout
 
 ```text
 esp32_temp_monitor/
-|- controller/
-|  |- controller.ino
-|  |- protocol.h
-|- satellite/
-|  |- satellite.ino
-|  |- protocol.h
-|- shared/
-|  |- protocol.h
-|- src/
-|  |- main.cpp
-|  |- satellite_main.cpp
-|- pc_logger/
-|  |- controller_terminal.py
-|  |- ota_satellite.py
-|- platformio.ini
+|- controller/                  Arduino controller sketch
+|- satellite/                   Arduino satellite sketch
+|- src/                         PlatformIO controller/satellite entry points
+|- shared/                      Shared protocol header
+|- pio_controller_src/          Alternate PlatformIO controller source
+|- pc_logger/                   CLI helpers for controller terminal and OTA
+|- Temp_and_HumidityLogger/     Tkinter + Matplotlib desktop logger
+|- platformio.ini               PlatformIO environments
 ```
 
 ## Hardware
 
 ### Controller
 
-- ESP32 board connected to the PC by USB
+- ESP32 development board connected to the PC by USB
 
 ### Satellite
 
-- ESP32 board
-- SHT85 sensor on I2C
+- ESP32 development board
+- SHT85 sensor over I2C
 
-Default I2C pins used by the satellite firmware:
+Default satellite I2C pins:
 
 - `GPIO21` = SDA
 - `GPIO22` = SCL
 
-Keep the SHT85 physically away from the ESP32 module and regulator if you want realistic temperature readings.
+Wiring:
 
-## Requirements
+```text
+SHT85 -> ESP32
+SCL   -> GPIO22
+VCC   -> 3V3
+GND   -> GND
+SDA   -> GPIO21
+```
+
+System view:
+
+```text
++--------------------+       USB Serial       +-------------------------+
+|      Computer      | <--------------------> |    ESP32 Controller     |
+| logger / GUI / CLI |                        |  JSON lines over USB    |
++--------------------+                        +------------+------------+
+                                                         |
+                                                 ESP-NOW |
+                                                         |
+              +------------------------------------------+------------------+
+              |                                          |                  |
+              v                                          v                  v
+     +-------------------+                     +-------------------+  +-------------------+
+     | ESP32 Satellite 1 |                     | ESP32 Satellite 2 |  | ESP32 Satellite N |
+     | + 1 x SHT85       |                     | + 1 x SHT85       |  | + 1 x SHT85       |
+     +-------------------+                     +-------------------+  +-------------------+
+```
+
+## Firmware Build
+
+Requirements:
 
 - Python 3
 - PlatformIO
-- `pyserial`
 
-Install the Python tools:
+Install PlatformIO if needed:
 
 ```bash
-pip install platformio pyserial
+pip install platformio
 ```
-
-## Build
 
 Build controller firmware:
 
@@ -97,68 +96,76 @@ Build satellite firmware:
 python -m platformio run -e satellite_upload
 ```
 
-## Flash Over USB
-
-Flash the controller on `COM6`:
+Flash controller over USB:
 
 ```bash
 python -m platformio run -e controller_upload -t upload
 ```
 
-Flash a satellite on `COM6`:
+Flash satellite over USB:
 
 ```bash
 python -m platformio run -e satellite_upload -t upload
 ```
 
-`platformio.ini` already contains the upload environments used above.
+`platformio.ini` currently uses `COM6` as the default upload port. Change that locally if your board is on a different port.
 
-## OTA Update For Satellites
+## PC Tools
 
-Satellite OTA goes through the controller serial port. The controller itself is still updated over USB flash, not OTA.
+### Controller Terminal
 
-Build the satellite firmware first:
+The controller serial helper is in `pc_logger/controller_terminal.py`.
 
-```bash
-python -m platformio run -e satellite_upload
-```
-
-Then upload to a satellite node through the controller:
-
-```bash
-#python pc_logger\ota_satellite.py --port COM6 --node-id 1 --firmware .pio\build\satellite_upload\firmware.bin
-python pc_logger\ota_satellite.py --port COM6 --node-id 1 --firmware .pio\build\satellite_upload\firmware.bin
-python pc_logger\ota_satellite.py --port COM6 --node-id 2 --firmware .pio\build\satellite_upload\firmware.bin
-```
-
-The OTA helper now quiets other known satellites first by temporarily moving them to a long poll interval, then restores their previous interval after a successful transfer. Use OTA one satellite at a time.
-
-## Terminal / Serial Use
-
-Controller serial settings:
-
-- Port: `COM6`
-- Baud: `115200`
-- Data bits: `8`
-- Stop bits: `1`
-- Parity: `None`
-- Flow control: `None`
-
-The controller boots with streaming disabled, so you get a prompt first.
-
-Recommended terminal helper:
+Run:
 
 ```bash
 python pc_logger\controller_terminal.py --port COM6
 ```
 
-That helper:
+It opens the serial port, pushes current PC time to the controller, and provides interactive command entry.
 
-- opens the controller serial port
-- pushes current PC time into the controller
-- lets you type controller commands interactively
+### Satellite OTA
 
-You can also use PuTTY or another serial terminal.
+The OTA helper is in `pc_logger/ota_satellite.py`.
+
+Build satellite firmware first, then upload through the controller:
+
+```bash
+python -m platformio run -e satellite_upload
+python pc_logger\ota_satellite.py --port COM6 --node-id 1 --firmware .pio\build\satellite_upload\firmware.bin
+```
+
+Run OTA one satellite at a time.
+
+### Desktop Logger
+
+The desktop GUI lives in `Temp_and_HumidityLogger/`.
+
+It provides:
+
+- Live temperature and humidity graphs
+- SQLite-backed session history
+- CSV export
+- Channel naming, colors, and calibration
+- Marker annotations
+- Split temperature and humidity tabs
+- COM-port control for Arduino and ESP controller sources
+
+Setup:
+
+```bash
+cd Temp_and_HumidityLogger
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements.txt
+python arduino_logger_v72.py
+```
+
+Packaging instructions are documented in [Temp_and_HumidityLogger/README.md](/C:/Users/LENOVO/Downloads/esp32_temp_monitor-20260414T164103Z-3-001/esp32_temp_monitor/Temp_and_HumidityLogger/README.md).
+
+## Large Dataset Note
+
+The desktop logger now caches per-channel downsampled chart data before redraw, which keeps pan/zoom and redraws responsive even when session history grows very large. Extremely large session loads can still be limited by database read time rather than chart rendering.
 
 ## Controller Commands
 
@@ -186,145 +193,13 @@ Available controller commands:
 - `OTA STATUS`
 - `OTA ABORT`
 
-## Command Notes
-
-### `NODES`
-
-Prints stored node information, including:
-
-- `node_id`
-- `name`
-- `mac`
-- `report_interval_ms`
-- `fw_version`
-- `rssi_dbm`
-- `signal_pct`
-- `temp_offset_c`
-- `heater_enabled`
-- `sample_rate_hz`
-
-### `SETINT`
-
-Changes how often the controller polls a satellite.
-
-Example:
-
-```text
-SETINT 1 1000
-```
-
-### `SETSAMPLE`
-
-Changes the satellite background sample rate and stores it in flash on the satellite.
-The satellite keeps sampling continuously, collapses those samples into `10 ms` chunk
-averages, and returns the average of the stored chunks when the controller polls it.
-
-Examples:
-
-```text
-SETSAMPLE 1 200
-SETSAMPLE ALL 100
-```
-
-### `SETTOFF`
-
-Applies a temperature offset on the satellite.
-
-Example:
-
-```text
-SETTOFF 1 -1.50
-```
-
-### `HEATER`
-
-Turns the SHT85 heater on or off on a satellite.
-
-Examples:
-
-```text
-HEATER 1 ON
-HEATER 1 OFF
-```
-
-### `RENAME`
-
-Renames a satellite from the controller and stores the new name in flash on the satellite,
-so it survives power loss and reboot.
-
-Example:
-
-```text
-RENAME 1 greenhouse
-```
-
-### `STREAM`
-
-- `STREAM ON` enables live JSON telemetry
-- `STREAM OFF` stops live telemetry and leaves the prompt quiet
-
-## Example Workflow
-
-### First-time programming
-
-1. Flash the controller over USB.
-2. Flash each satellite over USB once.
-3. Power all devices.
-4. Open the controller terminal.
-5. Use `BIND` if needed.
-6. Check `NODES`.
-
-### Normal use
-
-1. Connect to the controller.
-2. Use `NODES` to inspect satellites.
-3. Use `STREAM ON` to watch live data.
-4. Use `SETINT`, `SETTOFF`, or `HEATER` as needed.
-
-### Satellite firmware rollout
-
-1. Build `satellite_upload`.
-2. OTA one satellite at a time through the controller with `ota_satellite.py`.
-3. If the controller firmware changed too, flash the controller over USB last.
-
-If the satellite protocol changed, the safe order is:
-
-1. OTA satellites first while the old controller can still talk to them.
-2. Flash the controller last.
-
-If an OTA transfer is interrupted, reset that satellite before retrying.
-
-## Satellite LED Status
-
-The built-in LED on each satellite is used as a simple state indicator:
-
-- unbound: double blink
-- bound and idle: short heartbeat pulse
-- radio activity such as bind/config/sample/OTA ack traffic: brief solid pulse
-- OTA in progress: fast blink
-- OTA complete, waiting to reboot: solid on
-
-## Output Format
-
-Example reading:
-
-```json
-{"event":"reading","node_id":1,"name":"satellite","temperature_c":22.54,"humidity_pct":47.16,"sensor_ok":true,"fw_version":"2.1","rssi_dbm":-50,"signal_pct":100,"mac":"1C:C3:AB:C2:1E:7C"}
-```
-
-Example nodes response:
-
-```json
-{"event":"nodes","items":[{"node_id":1,"name":"satellite","mac":"1C:C3:AB:C2:1E:7C","last_seen_ms":12638,"report_interval_ms":1000,"fw_version":"2.1","rssi_dbm":-51,"signal_pct":97,"temp_offset_c":0.00,"heater_enabled":false,"next_poll_in_ms":955}]}
-```
-
 ## Current Behavior
 
-- Controller stream is off by default at boot.
-- Controller polls satellites and spaces polls automatically when multiple satellites are present.
-- Satellites sample the SHT85 continuously at a configurable target rate up to `200 Hz`.
-- Poll responses are averaged from stored `10 ms` sample chunks, not a single instant read.
-- Time can be pushed in from the connected host terminal.
-- Satellite firmware version is reported to the controller.
-- RSSI is reported as both `rssi_dbm` and `signal_pct`.
-- Satellite heater state is controlled by the controller and stored in flash.
+- Controller stream is off by default at boot
+- Controller polls satellites and spaces polls automatically when multiple satellites are present
+- Satellites sample SHT85 continuously at a configurable target rate up to `200 Hz`
+- Poll responses are averaged from stored `10 ms` sample chunks
+- Satellite firmware version is reported to the controller
+- RSSI is reported as both `rssi_dbm` and `signal_pct`
+- Satellite heater state is controlled by the controller and stored in flash
+

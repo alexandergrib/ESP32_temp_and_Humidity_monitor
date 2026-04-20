@@ -7,6 +7,34 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $projectRoot
 
+$appName = "TempHumidityLogger"
+$distAppDir = Join-Path $projectRoot "dist\$appName"
+$runtimeRoot = $env:LOCALAPPDATA
+if (-not $runtimeRoot) {
+    $runtimeRoot = $projectRoot
+}
+$runtimeDataDir = Join-Path $runtimeRoot $appName
+
+function Backup-LegacyRuntimeData {
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceDir,
+        [Parameter(Mandatory = $true)][string]$DestinationDir
+    )
+
+    if (-not (Test-Path $SourceDir)) {
+        return
+    }
+
+    New-Item -ItemType Directory -Force -Path $DestinationDir | Out-Null
+    $patterns = @("config.ini", "logger.db*", "*.csv")
+    foreach ($pattern in $patterns) {
+        $items = Get-ChildItem -Path $SourceDir -Filter $pattern -File -ErrorAction SilentlyContinue
+        foreach ($item in $items) {
+            Copy-Item -Path $item.FullName -Destination (Join-Path $DestinationDir $item.Name) -Force
+        }
+    }
+}
+
 $pythonExe = Join-Path $projectRoot "venv\Scripts\python.exe"
 if (-not (Test-Path $pythonExe)) {
     $answer = (Read-Host "Python venv not found. Create it now? (y/n)").Trim().ToLowerInvariant()
@@ -24,6 +52,8 @@ if (-not (Test-Path $pythonExe)) {
         throw "Failed to create venv at: $projectRoot\venv"
     }
 }
+
+Backup-LegacyRuntimeData -SourceDir $distAppDir -DestinationDir $runtimeDataDir
 
 if ($Clean) {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$projectRoot\build"
@@ -55,7 +85,7 @@ if ($missingModules.Count -gt 0) {
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to upgrade pip."
         }
-        & $pythonExe -m pip install -r requirements.txt pyinstaller
+        & $pythonExe -m pip install -r requirements.txt
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to install required dependencies."
         }
@@ -106,3 +136,5 @@ Write-Host "Build complete:"
 Write-Host "  $projectRoot\dist\TempHumidityLogger\TempHumidityLogger.exe"
 Write-Host "Libraries:"
 Write-Host "  $projectRoot\dist\TempHumidityLogger\libraries"
+Write-Host "Runtime data:"
+Write-Host "  $runtimeDataDir"

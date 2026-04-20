@@ -47,6 +47,7 @@ class ArduinoLoggerApp:
     ]
     ZOOM_FACTOR = 0.70
     DEFAULT_GRAPH_SPLIT_RATIO = 0.75
+    APP_DATA_DIR_NAME = "TempHumidityLogger"
 
     def __init__(self, root):
         self.root = root
@@ -54,10 +55,11 @@ class ArduinoLoggerApp:
         self.root.geometry("1024x680")
 
         if getattr(sys, "frozen", False):
-            self.base_dir = os.path.abspath(os.path.dirname(sys.executable))
+            self.install_dir = os.path.abspath(os.path.dirname(sys.executable))
         else:
-            self.base_dir = os.path.abspath(os.path.dirname(__file__))
-        self.resource_dir = getattr(sys, "_MEIPASS", self.base_dir)
+            self.install_dir = os.path.abspath(os.path.dirname(__file__))
+        self.base_dir = self.resolve_runtime_dir(self.install_dir)
+        self.resource_dir = getattr(sys, "_MEIPASS", self.install_dir)
         self.config_path = os.path.join(self.base_dir, self.CONFIG_FILE_NAME)
         self.runtime_settings = self.runtime_settings_defaults()
         self.load_runtime_settings()
@@ -110,6 +112,7 @@ class ArduinoLoggerApp:
         self.temp_series_values = [deque(maxlen=self.PLOT_HISTORY_SECONDS) for _ in range(self.CHANNEL_COUNT)]
         self.hum_series_values = [deque(maxlen=self.PLOT_HISTORY_SECONDS) for _ in range(self.CHANNEL_COUNT)]
         self.last_plot_second = [None] * self.CHANNEL_COUNT
+        self._render_cache = self._build_empty_render_cache()
 
         # Graph redraw state
         self._redraw_pending = False
@@ -161,6 +164,42 @@ class ArduinoLoggerApp:
         if ch_idx < self.ARDUINO_CHANNEL_COUNT:
             return "Arduino CH{0}".format(ch_idx)
         return "ESP Slot {0}".format(ch_idx - self.ARDUINO_CHANNEL_COUNT + 1)
+
+    def resolve_runtime_dir(self, install_dir):
+        if not getattr(sys, "frozen", False):
+            return install_dir
+        root_dir = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or install_dir
+        runtime_dir = os.path.join(root_dir, self.APP_DATA_DIR_NAME)
+        try:
+            os.makedirs(runtime_dir, exist_ok=True)
+        except Exception:
+            return install_dir
+        self.migrate_legacy_runtime_files(install_dir, runtime_dir)
+        return runtime_dir
+
+    def migrate_legacy_runtime_files(self, install_dir, runtime_dir):
+        if not install_dir or not runtime_dir or os.path.normcase(install_dir) == os.path.normcase(runtime_dir):
+            return
+        legacy_names = [
+            self.CONFIG_FILE_NAME,
+            self.DB_FILE_NAME,
+            self.DB_FILE_NAME + "-wal",
+            self.DB_FILE_NAME + "-shm",
+            self.TEMP_DATA_FILE_NAME,
+            self.HUM_DATA_FILE_NAME,
+        ]
+        for file_name in legacy_names:
+            src_path = os.path.join(install_dir, file_name)
+            dst_path = os.path.join(runtime_dir, file_name)
+            if not os.path.exists(src_path) or os.path.exists(dst_path):
+                continue
+            try:
+                with open(src_path, "rb") as src_file:
+                    data = src_file.read()
+                with open(dst_path, "wb") as dst_file:
+                    dst_file.write(data)
+            except Exception:
+                pass
 
     def channel_display_id(self, ch_idx):
         if ch_idx < self.ARDUINO_CHANNEL_COUNT:
@@ -395,6 +434,40 @@ class ArduinoLoggerApp:
     def series_values_for_kind(self, kind):
         return self.temp_series_values if kind == "temp" else self.hum_series_values
 
+    def _build_empty_render_cache(self):
+        return {kind: [None] * self.CHANNEL_COUNT for kind in ("temp", "hum")}
+
+    def _invalidate_render_cache(self, kind=None, channel_index=None):
+        kinds = (kind,) if kind in ("temp", "hum") else ("temp", "hum")
+        for cache_kind in kinds:
+            cache_entries = self._render_cache.setdefault(cache_kind, [None] * self.CHANNEL_COUNT)
+            if channel_index is None:
+                for idx in range(self.CHANNEL_COUNT):
+                    cache_entries[idx] = None
+                continue
+            if 0 <= channel_index < self.CHANNEL_COUNT:
+                cache_entries[channel_index] = None
+
+    def _sample_render_series(self, times_source, values_source):
+        times = list(times_source)
+        values = list(values_source)
+        if len(times) <= self.MAX_RENDER_POINTS:
+            return times, values
+        step = int(math.ceil(len(times) / float(self.MAX_RENDER_POINTS)))
+        return times[::step], values[::step]
+
+    def _render_series_for_channel(self, kind, channel_index):
+        cache_entries = self._render_cache.setdefault(kind, [None] * self.CHANNEL_COUNT)
+        cached = cache_entries[channel_index]
+        if cached is not None:
+            return cached
+        sampled = self._sample_render_series(
+            self.series_times[channel_index],
+            self.series_values_for_kind(kind)[channel_index],
+        )
+        cache_entries[channel_index] = sampled
+        return sampled
+
     def graph_title_text(self, kind):
         return "Temperature" if kind == "temp" else "Humidity"
 
@@ -622,6 +695,9 @@ class ArduinoLoggerApp:
         cls.DEFAULT_GRAPH_SPLIT_RATIO = float(settings["default_graph_split_ratio"])
         self.temp_data_csv_path = os.path.join(self.base_dir, self.TEMP_DATA_FILE_NAME)
         self.hum_data_csv_path = os.path.join(self.base_dir, self.HUM_DATA_FILE_NAME)
+        self._invalidate_render_cache()
+        if self.graph_contexts:
+            self._schedule_redraw()
 
     def load_runtime_settings(self):
         cfg = configparser.ConfigParser()
@@ -2111,6 +2187,7 @@ class ArduinoLoggerApp:
         self._clear_all_markers()
         self.esp_slot_by_node_id.clear()
         self.esp_node_state.clear()
+        self._invalidate_render_cache()
         for i in range(self.CHANNEL_COUNT):
             self.temp_history[i].clear()
             self.hum_history[i].clear()
@@ -3948,6 +4025,7 @@ class ArduinoLoggerApp:
                 hum_smoothed if hum_smoothed is not None else math.nan
             )
             self.last_plot_second[channel_index] = ts_sec
+        self._invalidate_render_cache(channel_index=channel_index)
 
     def _schedule_redraw(self):
         """Request a graph redraw on the next Tk idle cycle."""
@@ -3967,18 +4045,17 @@ class ArduinoLoggerApp:
             ctx = self.graph_contexts.get(kind)
             if ctx is None:
                 continue
-            series_values = self.series_values_for_kind(kind)
             any_points = False
             for i in range(self.CHANNEL_COUNT):
-                times = list(self.series_times[i])
-                vals = list(series_values[i])
-                if len(times) > self.MAX_RENDER_POINTS:
-                    step = int(math.ceil(len(times) / float(self.MAX_RENDER_POINTS)))
-                    times = times[::step]
-                    vals = vals[::step]
-                ctx["lines"][i].set_data(times, vals)
-                ctx["lines"][i].set_visible(self.channel_record_enabled[i] and i in visible_channels)
-                if times and self.channel_record_enabled[i] and i in visible_channels:
+                is_visible = self.channel_record_enabled[i] and i in visible_channels
+                line = ctx["lines"][i]
+                line.set_visible(is_visible)
+                if not is_visible:
+                    line.set_data([], [])
+                    continue
+                times, vals = self._render_series_for_channel(kind, i)
+                line.set_data(times, vals)
+                if times:
                     any_points = True
 
             if any_points and self._auto_view:
