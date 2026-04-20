@@ -152,6 +152,30 @@ def wait_for_node_ready(ser: serial.Serial, node_id: int, timeout: float) -> dic
     raise TimeoutError(f"Timed out waiting for node {node_id} to become active")
 
 
+def wait_for_ota_ready_state(ser: serial.Serial, node_id: int, enabled: bool, timeout: float) -> dict:
+    deadline = time.time() + timeout
+    next_probe_at = 0.0
+    while time.time() < deadline:
+        now = time.time()
+        if now >= next_probe_at:
+            send_command(ser, "NODES")
+            next_probe_at = now + 1.0
+        remaining = max(0.1, deadline - time.time())
+        event = read_event(ser, remaining)
+        if event is None:
+            continue
+        if event.get("event") == "config_ack" and int(event.get("node_id", 0)) == node_id:
+            if bool(event.get("ota_ready")) == enabled:
+                return event
+        if event.get("event") == "nodes":
+            for item in event.get("items", []):
+                if int(item.get("node_id", 0)) != node_id:
+                    continue
+                if bool(item.get("ota_ready")) == enabled:
+                    return item
+    raise TimeoutError(f"Timed out waiting for node {node_id} ota_ready={enabled}")
+
+
 def wait_for_nodes_snapshot(ser: serial.Serial, timeout: float) -> list[dict]:
     deadline = time.time() + timeout
     next_probe_at = 0.0
@@ -198,6 +222,7 @@ def main() -> int:
         read_event(ser, 2.0)
         snapshot = wait_for_nodes_snapshot(ser, 8.0)
         saved_intervals: dict[int, int] = {}
+        target_prepared = False
         for item in snapshot:
             node_id = int(item.get("node_id", 0))
             interval = int(item.get("report_interval_ms", 30000))
@@ -205,77 +230,88 @@ def main() -> int:
             quiet_ms = 30000
             send_command(ser, f"SETINT {node_id} {quiet_ms}")
             read_event(ser, 2.0)
-        send_command(ser, f"SETINT {args.node_id} 30000")
-        wait_for_node_ready(ser, args.node_id, 20.0)
+        try:
+            send_command(ser, f"SETINT {args.node_id} 30000")
+            wait_for_node_ready(ser, args.node_id, 20.0)
+            send_command(ser, f"OTA READY {args.node_id} ON")
+            wait_for_ota_ready_state(ser, args.node_id, True, 10.0)
+            target_prepared = True
 
-        begin_ack = None
-        for attempt in range(HOST_RETRIES):
-            send_command(ser, f"OTA BEGIN {args.node_id} {total_size} {crc32:08x}")
-            try:
-                begin_ack = wait_for_ota_ack(ser, BEGIN_PHASE, BEGIN_TIMEOUT_S)
-                break
-            except TimeoutError:
-                if attempt + 1 == HOST_RETRIES:
-                    raise
-        assert begin_ack is not None
-        if begin_ack.get("status") not in {"ok", "busy"}:
-            raise RuntimeError(json.dumps(begin_ack))
-
-        if begin_ack.get("status") == "busy":
-            offset = int(begin_ack.get("bytes_received", 0))
-            print(
-                f"Controller will resync an existing OTA session for node {args.node_id} "
-                f"from remote offset {offset}"
-            )
-        else:
-            offset = int(begin_ack.get("bytes_received", 0))
-        while offset < total_size:
-            chunk = payload[offset: offset + CHUNK_BYTES]
-            ack = None
+            begin_ack = None
             for attempt in range(HOST_RETRIES):
-                send_command(ser, f"OTA CHUNK {offset} {chunk.hex()}")
+                send_command(ser, f"OTA BEGIN {args.node_id} {total_size} {crc32:08x}")
                 try:
-                    ack = wait_for_ota_ack(ser, CHUNK_PHASE, CHUNK_TIMEOUT_S)
+                    begin_ack = wait_for_ota_ack(ser, BEGIN_PHASE, BEGIN_TIMEOUT_S)
                     break
                 except TimeoutError:
                     if attempt + 1 == HOST_RETRIES:
                         raise
-            assert ack is not None
-            status = ack.get("status")
-            ack_offset = int(ack.get("bytes_received", offset))
+            assert begin_ack is not None
+            if begin_ack.get("status") not in {"ok", "busy"}:
+                raise RuntimeError(json.dumps(begin_ack))
 
-            if status == "ok":
-                offset = ack_offset
-                print(f"Progress: {offset}/{total_size}")
-                time.sleep(INTER_CHUNK_DELAY_S)
-                continue
+            if begin_ack.get("status") == "busy":
+                offset = int(begin_ack.get("bytes_received", 0))
+                print(
+                    f"Controller will resync an existing OTA session for node {args.node_id} "
+                    f"from remote offset {offset}"
+                )
+            else:
+                offset = int(begin_ack.get("bytes_received", 0))
+            while offset < total_size:
+                chunk = payload[offset: offset + CHUNK_BYTES]
+                ack = None
+                for attempt in range(HOST_RETRIES):
+                    send_command(ser, f"OTA CHUNK {offset} {chunk.hex()}")
+                    try:
+                        ack = wait_for_ota_ack(ser, CHUNK_PHASE, CHUNK_TIMEOUT_S)
+                        break
+                    except TimeoutError:
+                        if attempt + 1 == HOST_RETRIES:
+                            raise
+                assert ack is not None
+                status = ack.get("status")
+                ack_offset = int(ack.get("bytes_received", offset))
 
-            if status == "offset_mismatch":
-                offset = ack_offset
-                print(f"Resyncing offset to {offset}")
-                time.sleep(INTER_CHUNK_DELAY_S)
-                continue
+                if status == "ok":
+                    offset = ack_offset
+                    print(f"Progress: {offset}/{total_size}")
+                    time.sleep(INTER_CHUNK_DELAY_S)
+                    continue
 
-            raise RuntimeError(json.dumps(ack))
+                if status == "offset_mismatch":
+                    offset = ack_offset
+                    print(f"Resyncing offset to {offset}")
+                    time.sleep(INTER_CHUNK_DELAY_S)
+                    continue
 
-        end_ack = None
-        for attempt in range(HOST_RETRIES):
-            send_command(ser, "OTA END")
-            try:
-                end_ack = wait_for_ota_ack(ser, END_PHASE, END_TIMEOUT_S)
-                break
-            except TimeoutError:
-                if attempt + 1 == HOST_RETRIES:
-                    raise
-        assert end_ack is not None
-        if end_ack.get("status") != "ok":
-            raise RuntimeError(json.dumps(end_ack))
+                raise RuntimeError(json.dumps(ack))
 
-        for node_id, interval in saved_intervals.items():
-            if interval == 30000:
-                continue
-            send_command(ser, f"SETINT {node_id} {interval}")
-            read_event(ser, 2.0)
+            end_ack = None
+            for attempt in range(HOST_RETRIES):
+                send_command(ser, "OTA END")
+                try:
+                    end_ack = wait_for_ota_ack(ser, END_PHASE, END_TIMEOUT_S)
+                    break
+                except TimeoutError:
+                    if attempt + 1 == HOST_RETRIES:
+                        raise
+            assert end_ack is not None
+            if end_ack.get("status") != "ok":
+                raise RuntimeError(json.dumps(end_ack))
+        finally:
+            if target_prepared:
+                send_command(ser, f"OTA READY {args.node_id} OFF")
+                try:
+                    wait_for_ota_ready_state(ser, args.node_id, False, 8.0)
+                except Exception:
+                    pass
+
+            for node_id, interval in saved_intervals.items():
+                if interval == 30000:
+                    continue
+                send_command(ser, f"SETINT {node_id} {interval}")
+                read_event(ser, 2.0)
 
     print("OTA upload complete")
     return 0

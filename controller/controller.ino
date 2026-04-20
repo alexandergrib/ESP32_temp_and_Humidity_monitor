@@ -20,7 +20,7 @@ static constexpr uint8_t STATUS_LED_PIN = LED_BUILTIN;
 
 static constexpr uint32_t STATUS_LED_PERIOD_MS = 1000;
 static constexpr uint32_t STATUS_LED_ON_MS = 80;
-static constexpr uint32_t MIN_POLL_GAP_MS = 120;
+static constexpr uint32_t MIN_REPORT_SLOT_GAP_MS = 250;
 static constexpr uint32_t OFFLINE_REPROBE_MS = 2000;
 static constexpr uint32_t OTA_ACK_TIMEOUT_MS = 1500;
 static constexpr uint8_t OTA_MAX_RETRIES = 3;
@@ -45,9 +45,11 @@ struct NodeRecord {
     uint8_t fwMinor = 0;
     int8_t lastRssiDbm = 0;
     bool heaterEnabled = false;
+    bool otaReady = false;
     uint16_t sampleRateHz = DEFAULT_SAMPLE_RATE_HZ;
     float tempOffsetC = 0.0f;
-    uint32_t nextPollDueAtMs = 0;
+    uint32_t nextReportDelayMs = 0;
+    uint32_t lastDeliveredReadingSeq = 0;
 };
 
 struct RssiSample {
@@ -65,7 +67,6 @@ uint32_t bindWindowEndsAt = 0;
 uint32_t txSeq = 1;
 uint32_t lastLedBeatAt = 0;
 bool statusLedOn = false;
-uint32_t lastPollSentAt = 0;
 bool streamEnabled = false;
 bool promptShown = false;
 bool controllerTimeValid = false;
@@ -93,7 +94,8 @@ struct OtaSession {
 
 void handleIncomingPacket(const uint8_t* mac, const uint8_t* data, int len, int8_t rssiDbm = 0);
 void logSendStatus(esp_now_send_status_t status);
-void rebuildPollSchedule();
+void rebuildReportSchedule();
+void pushSchedulesToAllNodes();
 void handleOtaAck(const uint8_t* mac, const OtaAck& ack);
 void handleRenameAck(const uint8_t* mac, const RenameAck& ack);
 void retryPendingOtaFrame();
@@ -154,6 +156,7 @@ const char* otaStatusToString(uint8_t status) {
         case OTA_STATUS_END_FAILED: return "end_failed";
         case OTA_STATUS_CRC_MISMATCH: return "crc_mismatch";
         case OTA_STATUS_BUSY: return "busy";
+        case OTA_STATUS_NOT_READY: return "not_ready";
         default: return "unknown";
     }
 }
@@ -340,8 +343,10 @@ void sendBindAck(const uint8_t* mac, const NodeRecord& node) {
     fillHeader(ack.header, MSG_BIND_ACK, txSeq++, node.nodeId, millis());
     ack.assignedNodeId = node.nodeId;
     ack.reportIntervalMs = normalizeReportInterval(node.reportIntervalMs);
+    ack.nextReportDelayMs = node.nextReportDelayMs;
     ack.tempOffsetC = node.tempOffsetC;
     ack.heaterEnabled = node.heaterEnabled ? 1 : 0;
+    ack.otaReady = node.otaReady ? 1 : 0;
     ack.sampleRateHz = normalizeSampleRateHz(node.sampleRateHz);
     WiFi.macAddress(ack.controllerMac);
     ack.accepted = 1;
@@ -349,17 +354,53 @@ void sendBindAck(const uint8_t* mac, const NodeRecord& node) {
     esp_now_send(mac, reinterpret_cast<const uint8_t*>(&ack), sizeof(ack));
 }
 
-void sendConfig(uint32_t nodeId, uint32_t reportIntervalMs, float tempOffsetC, bool heaterEnabled, uint16_t sampleRateHz) {
+void sendConfig(
+    uint32_t nodeId,
+    uint32_t reportIntervalMs,
+    uint32_t nextReportDelayMs,
+    float tempOffsetC,
+    bool heaterEnabled,
+    bool otaReady,
+    uint16_t sampleRateHz
+) {
     int idx = findNodeById(nodeId);
     if (idx < 0) return;
     ConfigSet cfg{};
     fillHeader(cfg.header, MSG_CONFIG_SET, txSeq++, nodeId, millis());
     cfg.reportIntervalMs = normalizeReportInterval(reportIntervalMs);
+    cfg.nextReportDelayMs = nextReportDelayMs;
     cfg.tempOffsetC = tempOffsetC;
     cfg.heaterEnabled = heaterEnabled ? 1 : 0;
+    cfg.otaReady = otaReady ? 1 : 0;
     cfg.sampleRateHz = normalizeSampleRateHz(sampleRateHz);
     ensurePeer(nodes[idx].mac);
     esp_now_send(nodes[idx].mac, reinterpret_cast<const uint8_t*>(&cfg), sizeof(cfg));
+}
+
+void sendNodeConfig(size_t idx) {
+    if (idx >= MAX_NODES || !nodes[idx].used) return;
+    sendConfig(
+        nodes[idx].nodeId,
+        nodes[idx].reportIntervalMs,
+        nodes[idx].nextReportDelayMs,
+        nodes[idx].tempOffsetC,
+        nodes[idx].heaterEnabled,
+        nodes[idx].otaReady,
+        nodes[idx].sampleRateHz
+    );
+}
+
+void setNodeOtaReady(size_t idx, bool enabled, bool pushConfig = true) {
+    if (idx >= MAX_NODES || !nodes[idx].used) return;
+    nodes[idx].otaReady = enabled;
+    if (pushConfig) {
+        sendNodeConfig(idx);
+    }
+    printJsonEvent(
+        "{\"event\":\"ota_ready\",\"node_id\":" + String(nodes[idx].nodeId) +
+        ",\"enabled\":" + String(enabled ? "true" : "false") + "}",
+        true
+    );
 }
 
 void sendRename(uint32_t nodeId, const String& requestedName) {
@@ -374,11 +415,14 @@ void sendRename(uint32_t nodeId, const String& requestedName) {
     esp_now_send(nodes[idx].mac, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
 }
 
-void sendSampleRequest(size_t idx) {
-    SampleRequest req{};
-    fillHeader(req.header, MSG_SAMPLE_REQ, txSeq++, nodes[idx].nodeId, millis());
+void sendReadingAck(size_t idx, uint32_t readingSequence) {
+    if (idx >= MAX_NODES || !nodes[idx].used) return;
+    ReadingAck ack{};
+    fillHeader(ack.header, MSG_READING_ACK, txSeq++, nodes[idx].nodeId, millis());
+    ack.readingSequence = readingSequence;
+    ack.accepted = 1;
     ensurePeer(nodes[idx].mac);
-    esp_now_send(nodes[idx].mac, reinterpret_cast<const uint8_t*>(&req), sizeof(req));
+    esp_now_send(nodes[idx].mac, reinterpret_cast<const uint8_t*>(&ack), sizeof(ack));
 }
 
 void armOtaAckWait(OtaPhase phase, uint32_t offset = 0, uint16_t len = 0, const uint8_t* data = nullptr) {
@@ -426,6 +470,7 @@ bool beginOta(uint32_t nodeId, uint32_t totalSize, uint32_t expectedCrc32) {
 
     int idx = findNodeById(nodeId);
     if (idx < 0) return false;
+    if (!nodes[idx].otaReady) return false;
 
     otaSession.active = true;
     otaSession.nodeId = nodeId;
@@ -463,6 +508,12 @@ bool finishOta() {
 }
 
 void abortOta(const char* reason) {
+    if (otaSession.active) {
+        int idx = findNodeById(otaSession.nodeId);
+        if (idx >= 0) {
+            setNodeOtaReady(static_cast<size_t>(idx), false);
+        }
+    }
     printJsonEvent(String("{\"event\":\"ota_aborted\",\"reason\":\"") + reason + "\"}");
     clearOtaSession();
 }
@@ -491,60 +542,38 @@ size_t countActiveNodes() {
     return count;
 }
 
-void rebuildPollSchedule() {
-    const uint32_t now = millis();
+void rebuildReportSchedule() {
     size_t activeCount = countActiveNodes();
     if (activeCount == 0) return;
-
-    uint32_t shortestIntervalMs = UINT32_MAX;
+    uint32_t cycleMs = activeCount * MIN_REPORT_SLOT_GAP_MS;
     for (const NodeRecord& node : nodes) {
         if (!node.used) continue;
-        const uint32_t effectiveIntervalMs =
-            nodeNeedsFastProbe(node, now) ? OFFLINE_REPROBE_MS : normalizeReportInterval(node.reportIntervalMs);
-        shortestIntervalMs = min(shortestIntervalMs, effectiveIntervalMs);
+        cycleMs = max(cycleMs, normalizeReportInterval(node.reportIntervalMs));
     }
-
-    const uint32_t spacingMs = max(MIN_POLL_GAP_MS, shortestIntervalMs / activeCount);
+    const uint32_t spacingMs = max(MIN_REPORT_SLOT_GAP_MS, cycleMs / activeCount);
     uint32_t offsetMs = 0;
     for (NodeRecord& node : nodes) {
         if (!node.used) continue;
-        node.nextPollDueAtMs = now + offsetMs;
+        node.reportIntervalMs = cycleMs;
+        node.nextReportDelayMs = offsetMs;
         offsetMs += spacingMs;
     }
 }
 
-void pollSatellites() {
-    if (otaSession.active) return;
-
-    const uint32_t now = millis();
-    if (!timeReached(now, lastPollSentAt + MIN_POLL_GAP_MS)) return;
-
-    int dueIdx = -1;
-    uint32_t earliestDueAt = 0;
+void pushSchedulesToAllNodes() {
     for (size_t i = 0; i < MAX_NODES; ++i) {
         if (!nodes[i].used) continue;
-        if (!timeReached(now, nodes[i].nextPollDueAtMs)) continue;
-        if (dueIdx < 0 || timeReached(earliestDueAt, nodes[i].nextPollDueAtMs)) {
-            dueIdx = static_cast<int>(i);
-            earliestDueAt = nodes[i].nextPollDueAtMs;
-        }
+        sendNodeConfig(i);
     }
-
-    if (dueIdx < 0) return;
-
-    sendSampleRequest(static_cast<size_t>(dueIdx));
-    const uint32_t nextDelayMs =
-        nodeNeedsFastProbe(nodes[dueIdx], now) ? OFFLINE_REPROBE_MS : normalizeReportInterval(nodes[dueIdx].reportIntervalMs);
-    nodes[dueIdx].nextPollDueAtMs = now + nextDelayMs;
-    lastPollSentAt = now;
 }
 
 void handleBindRequest(const uint8_t* mac, const BindRequest& req) {
-    if (!bindWindowOpen || millis() > bindWindowEndsAt) return;
-
     int idx = findNodeByMac(mac);
     bool isNewNode = false;
     if (idx < 0) {
+        if (!bindWindowOpen || millis() > bindWindowEndsAt) {
+            return;
+        }
         idx = allocateNodeSlot();
         if (idx < 0) {
             printJsonEvent("{\"event\":\"bind_rejected\",\"reason\":\"node_table_full\"}");
@@ -566,8 +595,9 @@ void handleBindRequest(const uint8_t* mac, const BindRequest& req) {
     }
     nodes[idx].lastSeenMs = millis();
     saveNode(idx);
-    rebuildPollSchedule();
+    rebuildReportSchedule();
     sendBindAck(mac, nodes[idx]);
+    pushSchedulesToAllNodes();
 
     printJsonEvent(
         "{\"event\":\"node_bound\",\"node_id\":" + String(nodes[idx].nodeId) +
@@ -580,12 +610,18 @@ void handleReading(const uint8_t* mac, const Reading& msg, int8_t rssiDbm) {
     int idx = findNodeByMac(mac);
     if (idx < 0) return;
     nodes[idx].lastSeenMs = millis();
+    if (nodes[idx].lastDeliveredReadingSeq == msg.header.sequence) {
+        sendReadingAck(static_cast<size_t>(idx), msg.header.sequence);
+        return;
+    }
     nodes[idx].lastTempC = msg.temperatureC;
     nodes[idx].lastHumidity = msg.humidityPct;
     nodes[idx].sensorOk = msg.sensorOk;
     nodes[idx].fwMajor = msg.reserved[0];
     nodes[idx].fwMinor = msg.reserved[1];
     nodes[idx].lastRssiDbm = rssiDbm;
+    nodes[idx].lastDeliveredReadingSeq = msg.header.sequence;
+    sendReadingAck(static_cast<size_t>(idx), msg.header.sequence);
 
     printJsonEvent(
         "{\"event\":\"reading\",\"node_id\":" + String(nodes[idx].nodeId) +
@@ -605,16 +641,19 @@ void handleConfigAck(const uint8_t* mac, const ConfigAck& msg) {
     if (idx < 0) return;
     nodes[idx].lastSeenMs = millis();
     nodes[idx].reportIntervalMs = normalizeReportInterval(msg.reportIntervalMs);
+    nodes[idx].nextReportDelayMs = msg.nextReportDelayMs;
     nodes[idx].tempOffsetC = msg.tempOffsetC;
     nodes[idx].heaterEnabled = msg.heaterEnabled != 0;
+    nodes[idx].otaReady = msg.otaReady != 0;
     nodes[idx].sampleRateHz = normalizeSampleRateHz(msg.sampleRateHz);
     saveNode(idx);
-    rebuildPollSchedule();
     printJsonEvent(
         "{\"event\":\"config_ack\",\"node_id\":" + String(nodes[idx].nodeId) +
         ",\"report_interval_ms\":" + String(nodes[idx].reportIntervalMs) +
+        ",\"next_report_delay_ms\":" + String(nodes[idx].nextReportDelayMs) +
         ",\"temp_offset_c\":" + String(nodes[idx].tempOffsetC, 2) +
         ",\"heater_enabled\":" + String(nodes[idx].heaterEnabled ? "true" : "false") +
+        ",\"ota_ready\":" + String(nodes[idx].otaReady ? "true" : "false") +
         ",\"sample_rate_hz\":" + String(nodes[idx].sampleRateHz) +
         ",\"applied\":" + String(msg.applied ? "true" : "false") + "}"
     );
@@ -682,6 +721,12 @@ void handleOtaAck(const uint8_t* mac, const OtaAck& ack) {
             otaSession.nextOffset = ack.bytesReceived;
             break;
         case OTA_PHASE_END:
+            {
+                int idx = findNodeById(otaSession.nodeId);
+                if (idx >= 0) {
+                    nodes[idx].otaReady = false;
+                }
+            }
             printJsonEvent(
                 "{\"event\":\"ota_complete\",\"node_id\":" + String(otaSession.nodeId) +
                 ",\"bytes\":" + String(ack.bytesReceived) + "}"
@@ -786,8 +831,9 @@ void listNodes() {
         Serial.print(",\"signal_pct\":"); Serial.print(rssiToSignalPercent(nodes[i].lastRssiDbm));
         Serial.print(",\"temp_offset_c\":"); Serial.print(nodes[i].tempOffsetC, 2);
         Serial.print(",\"heater_enabled\":"); Serial.print(nodes[i].heaterEnabled ? "true" : "false");
+        Serial.print(",\"ota_ready\":"); Serial.print(nodes[i].otaReady ? "true" : "false");
         Serial.print(",\"sample_rate_hz\":"); Serial.print(nodes[i].sampleRateHz);
-        Serial.print(",\"next_poll_in_ms\":"); Serial.print(static_cast<int32_t>(nodes[i].nextPollDueAtMs - millis()));
+        Serial.print(",\"next_report_delay_ms\":"); Serial.print(nodes[i].nextReportDelayMs);
         Serial.print("}");
     }
     Serial.println("]}");
@@ -820,7 +866,7 @@ void processSerialCommand(const String& raw) {
     cmd.trim();
     promptShown = false;
     if (cmd.equalsIgnoreCase("HELP")) {
-        Serial.println("Commands: HELP, NODES, BIND, BIND OFF, SETINT <nodeId> <ms>, SETINT ALL <ms>, SETSAMPLE <nodeId> <hz>, SETSAMPLE ALL <hz>, SETTOFF <nodeId> <tempOffsetC>, HEATER <nodeId> ON|OFF, RENAME <nodeId> <name>, STREAM OFF, STREAM ON, TIME STATUS, TIME SET <unixSeconds>, OTA BEGIN <nodeId> <size> <crc32hex>, OTA CHUNK <offset> <hex>, OTA END, OTA STATUS, OTA ABORT");
+        Serial.println("Commands: HELP, NODES, BIND, BIND OFF, SETINT <nodeId> <ms>, SETINT ALL <ms>, SETSAMPLE <nodeId> <hz>, SETSAMPLE ALL <hz>, SETTOFF <nodeId> <tempOffsetC>, HEATER <nodeId> ON|OFF, RENAME <nodeId> <name>, STREAM OFF, STREAM ON, TIME STATUS, TIME SET <unixSeconds>, OTA READY <nodeId> ON|OFF, OTA BEGIN <nodeId> <size> <crc32hex>, OTA CHUNK <offset> <hex>, OTA END, OTA STATUS, OTA ABORT");
     } else if (cmd.equalsIgnoreCase("NODES")) {
         listNodes();
     } else if (cmd.equalsIgnoreCase("BIND")) {
@@ -862,13 +908,16 @@ void processSerialCommand(const String& raw) {
         }
     } else if (cmd.startsWith("SETINT ")) {
         if (cmd.startsWith("SETINT ALL ")) {
-            uint32_t ms = cmd.substring(11).toInt();
+            uint32_t ms = normalizeReportInterval(cmd.substring(11).toInt());
             uint32_t appliedCount = 0;
             for (size_t i = 0; i < MAX_NODES; ++i) {
                 if (!nodes[i].used) continue;
-                sendConfig(nodes[i].nodeId, ms, nodes[i].tempOffsetC, nodes[i].heaterEnabled, nodes[i].sampleRateHz);
+                nodes[i].reportIntervalMs = ms;
+                saveNode(i);
                 appliedCount++;
             }
+            rebuildReportSchedule();
+            pushSchedulesToAllNodes();
             printJsonEvent(
                 "{\"event\":\"setint_all\",\"report_interval_ms\":" + String(ms) +
                 ",\"targets\":" + String(appliedCount) + "}",
@@ -878,9 +927,14 @@ void processSerialCommand(const String& raw) {
             int sp = cmd.indexOf(' ', 7);
             if (sp > 0) {
                 uint32_t nodeId = cmd.substring(7, sp).toInt();
-                uint32_t ms = cmd.substring(sp + 1).toInt();
+                uint32_t ms = normalizeReportInterval(cmd.substring(sp + 1).toInt());
                 int idx = findNodeById(nodeId);
-                if (idx >= 0) sendConfig(nodeId, ms, nodes[idx].tempOffsetC, nodes[idx].heaterEnabled, nodes[idx].sampleRateHz);
+                if (idx >= 0) {
+                    nodes[idx].reportIntervalMs = ms;
+                    saveNode(static_cast<size_t>(idx));
+                    rebuildReportSchedule();
+                    pushSchedulesToAllNodes();
+                }
             }
         }
     } else if (cmd.startsWith("SETSAMPLE ")) {
@@ -891,7 +945,7 @@ void processSerialCommand(const String& raw) {
                 if (!nodes[i].used) continue;
                 nodes[i].sampleRateHz = hz;
                 saveNode(i);
-                sendConfig(nodes[i].nodeId, nodes[i].reportIntervalMs, nodes[i].tempOffsetC, nodes[i].heaterEnabled, nodes[i].sampleRateHz);
+                sendNodeConfig(i);
                 appliedCount++;
             }
             printJsonEvent(
@@ -908,7 +962,7 @@ void processSerialCommand(const String& raw) {
                 if (idx >= 0) {
                     nodes[idx].sampleRateHz = hz;
                     saveNode(static_cast<size_t>(idx));
-                    sendConfig(nodeId, nodes[idx].reportIntervalMs, nodes[idx].tempOffsetC, nodes[idx].heaterEnabled, nodes[idx].sampleRateHz);
+                    sendNodeConfig(static_cast<size_t>(idx));
                 }
             }
         }
@@ -921,7 +975,7 @@ void processSerialCommand(const String& raw) {
             if (idx >= 0) {
                 nodes[idx].tempOffsetC = offsetC;
                 saveNode(static_cast<size_t>(idx));
-                sendConfig(nodeId, nodes[idx].reportIntervalMs, nodes[idx].tempOffsetC, nodes[idx].heaterEnabled, nodes[idx].sampleRateHz);
+                sendNodeConfig(static_cast<size_t>(idx));
             }
         }
     } else if (cmd.startsWith("HEATER ")) {
@@ -942,7 +996,7 @@ void processSerialCommand(const String& raw) {
                     return;
                 }
                 saveNode(static_cast<size_t>(idx));
-                sendConfig(nodeId, nodes[idx].reportIntervalMs, nodes[idx].tempOffsetC, nodes[idx].heaterEnabled, nodes[idx].sampleRateHz);
+                sendNodeConfig(static_cast<size_t>(idx));
             }
         }
     } else if (cmd.startsWith("RENAME ")) {
@@ -960,13 +1014,40 @@ void processSerialCommand(const String& raw) {
                 );
             }
         }
+    } else if (cmd.startsWith("OTA READY ")) {
+        int sp = cmd.indexOf(' ', 10);
+        if (sp > 0) {
+            uint32_t nodeId = cmd.substring(10, sp).toInt();
+            String value = cmd.substring(sp + 1);
+            value.trim();
+            int idx = findNodeById(nodeId);
+            if (idx >= 0) {
+                if (value.equalsIgnoreCase("ON")) {
+                    setNodeOtaReady(static_cast<size_t>(idx), true);
+                } else if (value.equalsIgnoreCase("OFF")) {
+                    setNodeOtaReady(static_cast<size_t>(idx), false);
+                } else {
+                    printJsonEvent("{\"event\":\"ota_error\",\"reason\":\"invalid_ready_value\"}", true);
+                    printPrompt();
+                    return;
+                }
+            }
+        }
     } else if (cmd.equalsIgnoreCase("OTA STATUS")) {
+        bool otaReady = false;
+        if (otaSession.nodeId != 0) {
+            int idx = findNodeById(otaSession.nodeId);
+            if (idx >= 0) {
+                otaReady = nodes[idx].otaReady;
+            }
+        }
         printJsonEvent(
             "{\"event\":\"ota_status\",\"active\":" + String(otaSession.active ? "true" : "false") +
             ",\"awaiting_ack\":" + String(otaSession.awaitingAck ? "true" : "false") +
             ",\"node_id\":" + String(otaSession.nodeId) +
             ",\"next_offset\":" + String(otaSession.nextOffset) +
-            ",\"bytes_received\":" + String(otaSession.bytesReceived) + "}"
+            ",\"bytes_received\":" + String(otaSession.bytesReceived) +
+            ",\"ota_ready\":" + String(otaReady ? "true" : "false") + "}"
         );
     } else if (cmd.equalsIgnoreCase("OTA ABORT")) {
         abortOta("host_request");
@@ -978,7 +1059,12 @@ void processSerialCommand(const String& raw) {
             uint32_t totalSize = cmd.substring(sp1 + 1, sp2).toInt();
             uint32_t expectedCrc32 = strtoul(cmd.substring(sp2 + 1).c_str(), nullptr, 16);
             if (!beginOta(nodeId, totalSize, expectedCrc32)) {
-                printJsonEvent("{\"event\":\"ota_error\",\"reason\":\"begin_rejected\"}");
+                int idx = findNodeById(nodeId);
+                const char* reason = (idx >= 0 && !nodes[idx].otaReady) ? "target_not_ready" : "begin_rejected";
+                printJsonEvent(
+                    "{\"event\":\"ota_error\",\"reason\":\"" + String(reason) + "\",\"node_id\":" + String(nodeId) + "}",
+                    true
+                );
             }
         }
     } else if (cmd.startsWith("OTA CHUNK ")) {
@@ -1015,7 +1101,7 @@ void setup() {
     initStatusLed();
 
     loadNodes();
-    rebuildPollSchedule();
+    rebuildReportSchedule();
 
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
@@ -1068,8 +1154,6 @@ void loop() {
         bindWindowOpen = false;
         Serial.println("{\"event\":\"bind_window\",\"open\":false}");
     }
-
-    pollSatellites();
 
     if (otaSession.active && otaSession.awaitingAck && timeReached(millis(), otaSession.ackDeadlineMs)) {
         if (otaSession.retryCount >= OTA_MAX_RETRIES) {

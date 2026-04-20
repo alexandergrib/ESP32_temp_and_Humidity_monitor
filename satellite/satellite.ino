@@ -46,6 +46,13 @@ static constexpr float SENSOR_MIN_VALID_TEMP_C = -40.0f;
 static constexpr float SENSOR_MAX_VALID_TEMP_C = 125.0f;
 static constexpr float SENSOR_MIN_VALID_HUMIDITY_PCT = 0.0f;
 static constexpr float SENSOR_MAX_VALID_HUMIDITY_PCT = 100.0f;
+static constexpr uint32_t READING_BURST_MS = 180;
+static constexpr uint32_t READING_ACK_TIMEOUT_MS = 250;
+static constexpr uint32_t READING_RETRY_BACKOFF_MS = 150;
+static constexpr uint8_t READING_MAX_RETRIES = 3;
+static constexpr uint32_t CONTROLLER_AWAKE_WINDOW_MS = 5000;
+static constexpr uint32_t UNBOUND_SLEEP_MS = 250;
+static constexpr size_t READING_BUFFER_CAPACITY = 8;
 
 Preferences prefs;
 SHT85 sht(SHT_DEFAULT_ADDRESS);
@@ -60,6 +67,7 @@ char nodeName[16] = "satellite";
 bool statusLedOn = false;
 float tempOffsetC = 0.0f;
 bool heaterEnabled = false;
+bool otaReady = false;
 uint32_t activityLedUntilMs = 0;
 
 bool sensorPresent = false;
@@ -68,6 +76,10 @@ float lastHumidity = NAN;
 uint32_t lastGoodSampleAtUs = 0;
 bool otaRebootPending = false;
 uint32_t otaRebootAtMs = 0;
+uint32_t nextReportDueAtMs = 0;
+uint32_t controllerAwakeUntilMs = 0;
+uint32_t lastControllerContactAtMs = 0;
+uint32_t lastRecoveryBindAttemptAtMs = 0;
 
 struct SatelliteOtaState {
     bool active = false;
@@ -95,14 +107,40 @@ struct SensorSamplerState {
     uint32_t bufferedChunkCount = 0;
 } sensorSampler;
 
+struct BufferedReading {
+    bool used = false;
+    uint32_t sequence = 0;
+    uint32_t sampledAtMs = 0;
+    uint32_t lastSendAtMs = 0;
+    uint8_t retryCount = 0;
+    float temperatureC = NAN;
+    float humidityPct = NAN;
+    uint8_t sensorOk = 0;
+};
+
+BufferedReading readingBuffer[READING_BUFFER_CAPACITY];
+size_t readingBufferHead = 0;
+size_t readingBufferCount = 0;
+
 void handleIncomingPacket(const uint8_t* data, int len);
 void logSendStatus(esp_now_send_status_t status);
+void pumpSensorSampling();
+void maintainControllerLink();
 
 void noteActivity() {
     activityLedUntilMs = millis() + STATUS_LED_ACTIVITY_MS;
 }
 
+void stayAwakeForController(uint32_t durationMs = CONTROLLER_AWAKE_WINDOW_MS) {
+    const uint32_t deadlineMs = millis() + durationMs;
+    controllerAwakeUntilMs = controllerAwakeUntilMs > deadlineMs ? controllerAwakeUntilMs : deadlineMs;
+}
+
 bool timeReachedUs(uint32_t now, uint32_t target) {
+    return static_cast<int32_t>(now - target) >= 0;
+}
+
+bool timeReachedMs(uint32_t now, uint32_t target) {
     return static_cast<int32_t>(now - target) >= 0;
 }
 
@@ -326,6 +364,61 @@ bool prepareReadingSnapshot(float& temperatureC, float& humidityPct, bool& senso
     return false;
 }
 
+BufferedReading* oldestBufferedReading() {
+    if (readingBufferCount == 0) {
+        return nullptr;
+    }
+    return &readingBuffer[readingBufferHead];
+}
+
+void dropOldestBufferedReading() {
+    if (readingBufferCount == 0) {
+        return;
+    }
+    readingBuffer[readingBufferHead] = BufferedReading{};
+    readingBufferHead = (readingBufferHead + 1U) % READING_BUFFER_CAPACITY;
+    readingBufferCount--;
+}
+
+bool enqueueBufferedReading(float temperatureC, float humidityPct, bool sensorOk) {
+    if (readingBufferCount >= READING_BUFFER_CAPACITY) {
+        return false;
+    }
+    const size_t insertIndex = (readingBufferHead + readingBufferCount) % READING_BUFFER_CAPACITY;
+    BufferedReading& item = readingBuffer[insertIndex];
+    item = BufferedReading{};
+    item.used = true;
+    item.sequence = txSeq++;
+    item.sampledAtMs = millis();
+    item.temperatureC = temperatureC;
+    item.humidityPct = humidityPct;
+    item.sensorOk = sensorOk ? 1 : 0;
+    readingBufferCount++;
+    return true;
+}
+
+void scheduleNextReport(uint32_t delayMs) {
+    nextReportDueAtMs = millis() + max<uint32_t>(delayMs, 25);
+}
+
+void captureScheduledReading() {
+    restartSensorSampler(true);
+    const uint32_t startedAtMs = millis();
+    while (!timeReachedMs(millis(), startedAtMs + READING_BURST_MS)) {
+        pumpSensorSampling();
+        delay(1);
+    }
+
+    float temperatureC = NAN;
+    float humidityPct = NAN;
+    bool sensorOk = false;
+    prepareReadingSnapshot(temperatureC, humidityPct, sensorOk);
+    if (!enqueueBufferedReading(temperatureC, humidityPct, sensorOk)) {
+        Serial.println("Reading buffer full, keeping oldest unsent data");
+    }
+    clearBufferedChunks();
+}
+
 void markSampleRequestScheduled(uint32_t nowUs) {
     if (sensorSampler.nextRequestAtUs == 0) {
         sensorSampler.nextRequestAtUs = nowUs;
@@ -460,26 +553,29 @@ void sendBindRequest() {
     noteActivity();
 }
 
-void sendReading() {
-    if (!isBound) return;
-    float averagedTempC = NAN;
-    float averagedHumidityPct = NAN;
-    bool averagedSensorOk = false;
-    prepareReadingSnapshot(averagedTempC, averagedHumidityPct, averagedSensorOk);
+bool sendReading() {
+    if (!isBound) return false;
+    BufferedReading* pending = oldestBufferedReading();
+    if (pending == nullptr) {
+        return false;
+    }
 
     Reading msg{};
-    fillHeader(msg.header, MSG_READING, txSeq++, nodeId, millis());
-    msg.temperatureC = averagedTempC;
-    msg.humidityPct = averagedHumidityPct;
+    fillHeader(msg.header, MSG_READING, pending->sequence, nodeId, millis());
+    msg.temperatureC = pending->temperatureC;
+    msg.humidityPct = pending->humidityPct;
     msg.vbat = NAN;
-    msg.sensorOk = averagedSensorOk ? 1 : 0;
+    msg.sensorOk = pending->sensorOk;
     msg.rssiHint = 0;
     msg.reserved[0] = FW_VERSION_MAJOR;
     msg.reserved[1] = FW_VERSION_MINOR;
     ensurePeer(controllerMac);
     esp_now_send(controllerMac, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
-    clearBufferedChunks();
+    pending->lastSendAtMs = millis();
+    pending->retryCount = min<uint8_t>(pending->retryCount + 1, 255);
     noteActivity();
+    stayAwakeForController();
+    return true;
 }
 
 void sendConfigAck(bool applied) {
@@ -487,9 +583,11 @@ void sendConfigAck(bool applied) {
     ConfigAck msg{};
     fillHeader(msg.header, MSG_CONFIG_ACK, txSeq++, nodeId, millis());
     msg.reportIntervalMs = reportIntervalMs;
+    msg.nextReportDelayMs = nextReportDueAtMs > millis() ? nextReportDueAtMs - millis() : 0;
     msg.tempOffsetC = tempOffsetC;
     msg.applied = applied ? 1 : 0;
     msg.heaterEnabled = heaterEnabled ? 1 : 0;
+    msg.otaReady = otaReady ? 1 : 0;
     msg.sampleRateHz = normalizeSampleRateHz(sampleRateHz);
     ensurePeer(controllerMac);
     esp_now_send(controllerMac, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
@@ -507,6 +605,18 @@ void sendRenameAck(bool applied) {
     noteActivity();
 }
 
+void handleReadingAck(const ReadingAck& ack) {
+    BufferedReading* pending = oldestBufferedReading();
+    if (pending == nullptr) {
+        return;
+    }
+    if (!ack.accepted || ack.readingSequence != pending->sequence) {
+        return;
+    }
+    dropOldestBufferedReading();
+    stayAwakeForController();
+}
+
 void sendOtaAck(OtaPhase phase, OtaStatus status, uint32_t bytesReceived, uint16_t detail = 0) {
     if (!isBound) return;
     OtaAck msg{};
@@ -521,6 +631,11 @@ void sendOtaAck(OtaPhase phase, OtaStatus status, uint32_t bytesReceived, uint16
 }
 
 void handleOtaBegin(const OtaBegin& msg) {
+    if (!otaReady) {
+        sendOtaAck(OTA_PHASE_BEGIN, OTA_STATUS_NOT_READY, otaState.bytesWritten);
+        return;
+    }
+
     if (otaState.active) {
         sendOtaAck(OTA_PHASE_BEGIN, OTA_STATUS_BUSY, otaState.bytesWritten);
         return;
@@ -613,6 +728,8 @@ void handleIncomingPacket(const uint8_t* data, int len) {
     if (len < static_cast<int>(sizeof(Header))) return;
     const Header* h = reinterpret_cast<const Header*>(data);
     if (!validHeader(*h)) return;
+    lastControllerContactAtMs = millis();
+    stayAwakeForController();
 
     if (h->type == MSG_BIND_ACK && len == sizeof(BindAck)) {
         const BindAck* ack = reinterpret_cast<const BindAck*>(data);
@@ -623,10 +740,14 @@ void handleIncomingPacket(const uint8_t* data, int len) {
         sampleRateHz = normalizeSampleRateHz(ack->sampleRateHz);
         tempOffsetC = ack->tempOffsetC;
         heaterEnabled = ack->heaterEnabled != 0;
+        otaReady = ack->otaReady != 0;
         applySensorConfig();
         restartSensorSampler(true);
         isBound = true;
         ensurePeer(controllerMac);
+        scheduleNextReport(ack->nextReportDelayMs);
+        lastControllerContactAtMs = millis();
+        lastRecoveryBindAttemptAtMs = 0;
         saveConfig();
         Serial.printf(
             "Bound to controller %s as node %lu fw %u.%u heater %s sample %uHz\n",
@@ -644,10 +765,17 @@ void handleIncomingPacket(const uint8_t* data, int len) {
         sampleRateHz = normalizeSampleRateHz(cfg->sampleRateHz);
         tempOffsetC = cfg->tempOffsetC;
         heaterEnabled = cfg->heaterEnabled != 0;
+        otaReady = cfg->otaReady != 0;
         applySensorConfig();
         restartSensorSampler(true);
+        scheduleNextReport(cfg->nextReportDelayMs);
+        lastControllerContactAtMs = millis();
+        lastRecoveryBindAttemptAtMs = 0;
         saveConfig();
         sendConfigAck(true);
+        noteActivity();
+    } else if (h->type == MSG_READING_ACK && len == sizeof(ReadingAck) && isBound) {
+        handleReadingAck(*reinterpret_cast<const ReadingAck*>(data));
         noteActivity();
     } else if (h->type == MSG_RENAME_SET && len == sizeof(RenameSet) && isBound) {
         const RenameSet* rename = reinterpret_cast<const RenameSet*>(data);
@@ -664,17 +792,121 @@ void handleIncomingPacket(const uint8_t* data, int len) {
     } else if (h->type == MSG_OTA_END && len == sizeof(OtaEnd) && isBound) {
         handleOtaEnd(*reinterpret_cast<const OtaEnd*>(data));
         noteActivity();
-    } else if (h->type == MSG_SAMPLE_REQ && len == sizeof(SampleRequest) && isBound) {
-        pumpSensorSampling();
-        sendReading();
-        noteActivity();
     }
+}
+
+void maintainControllerLink() {
+    if (!isBound || otaState.active || otaReady) {
+        return;
+    }
+
+    const uint32_t nowMs = millis();
+    const uint32_t staleAfterMs = max<uint32_t>(15000, normalizeReportInterval(reportIntervalMs) * 3U);
+    if (!timeReachedMs(nowMs, lastControllerContactAtMs + staleAfterMs)) {
+        return;
+    }
+
+    stayAwakeForController();
+    if (!timeReachedMs(nowMs, lastRecoveryBindAttemptAtMs + 3000)) {
+        return;
+    }
+
+    lastRecoveryBindAttemptAtMs = nowMs;
+    sendBindRequest();
+    Serial.println("Controller contact stale, rebinding...");
 }
 
 void logSendStatus(esp_now_send_status_t status) {
     if (status != ESP_NOW_SEND_SUCCESS) {
         Serial.println("Last send: fail");
     }
+}
+
+void queueScheduledReadingsIfDue() {
+    if (!isBound || otaState.active) {
+        return;
+    }
+    uint32_t nowMs = millis();
+    while (timeReachedMs(nowMs, nextReportDueAtMs)) {
+        captureScheduledReading();
+        nextReportDueAtMs += normalizeReportInterval(reportIntervalMs);
+        nowMs = millis();
+        if (readingBufferCount >= READING_BUFFER_CAPACITY) {
+            break;
+        }
+    }
+}
+
+void serviceReadingDelivery() {
+    if (!isBound || otaState.active) {
+        return;
+    }
+    BufferedReading* pending = oldestBufferedReading();
+    if (pending == nullptr) {
+        return;
+    }
+
+    const uint32_t nowMs = millis();
+    if (pending->lastSendAtMs == 0) {
+        sendReading();
+        return;
+    }
+
+    uint32_t nextRetryAtMs = pending->lastSendAtMs + READING_ACK_TIMEOUT_MS;
+    if (pending->retryCount >= READING_MAX_RETRIES) {
+        nextRetryAtMs = pending->lastSendAtMs + max<uint32_t>(normalizeReportInterval(reportIntervalMs), READING_ACK_TIMEOUT_MS);
+        if (timeReachedMs(nowMs, nextRetryAtMs)) {
+            pending->retryCount = 0;
+        }
+    } else {
+        nextRetryAtMs += READING_RETRY_BACKOFF_MS;
+    }
+
+    if (timeReachedMs(nowMs, nextRetryAtMs)) {
+        sendReading();
+    }
+}
+
+void lightSleepForMs(uint32_t sleepMs) {
+    if (sleepMs < 20) {
+        return;
+    }
+    esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(sleepMs) * 1000ULL);
+    esp_light_sleep_start();
+}
+
+void maybeSleep() {
+    if (otaState.active || otaRebootPending || otaReady) {
+        return;
+    }
+
+    const uint32_t nowMs = millis();
+    if (!timeReachedMs(nowMs, controllerAwakeUntilMs)) {
+        return;
+    }
+
+    if (!isBound) {
+        lightSleepForMs(UNBOUND_SLEEP_MS);
+        return;
+    }
+
+    uint32_t nextWakeAtMs = nextReportDueAtMs;
+    if (BufferedReading* pending = oldestBufferedReading()) {
+        uint32_t retryAtMs = pending->lastSendAtMs == 0
+            ? nowMs
+            : pending->lastSendAtMs + READING_ACK_TIMEOUT_MS + READING_RETRY_BACKOFF_MS;
+        if (pending->retryCount >= READING_MAX_RETRIES) {
+            retryAtMs = pending->lastSendAtMs + max<uint32_t>(normalizeReportInterval(reportIntervalMs), READING_ACK_TIMEOUT_MS);
+        }
+        if (timeReachedMs(nextWakeAtMs, retryAtMs)) {
+            nextWakeAtMs = retryAtMs;
+        }
+    }
+
+    if (timeReachedMs(nowMs + 20, nextWakeAtMs)) {
+        return;
+    }
+    lightSleepForMs(nextWakeAtMs - nowMs);
 }
 
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
@@ -725,6 +957,10 @@ void setup() {
 
     if (isBound) {
         ensurePeer(controllerMac);
+        scheduleNextReport(reportIntervalMs);
+        stayAwakeForController();
+        lastControllerContactAtMs = millis();
+        lastRecoveryBindAttemptAtMs = 0;
         Serial.printf(
             "Loaded binding: node %lu controller %s fw %u.%u\n",
             static_cast<unsigned long>(nodeId),
@@ -732,6 +968,8 @@ void setup() {
             FW_VERSION_MAJOR,
             FW_VERSION_MINOR
         );
+        sendBindRequest();
+        Serial.println("Rebinding with controller...");
     } else {
         Serial.println("Unbound. Waiting to pair with controller...");
     }
@@ -751,11 +989,14 @@ void loop() {
             sendBindRequest();
             Serial.println("Bind request sent");
         }
-        pumpSensorSampling();
+        maybeSleep();
         delay(1);
         return;
     }
 
-    pumpSensorSampling();
+    maintainControllerLink();
+    queueScheduledReadingsIfDue();
+    serviceReadingDelivery();
+    maybeSleep();
     delay(1);
 }

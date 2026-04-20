@@ -3525,6 +3525,9 @@ class ArduinoLoggerApp:
         if not self.source_connected["esp"]:
             return False
         if self.send_esp_command("SETINT ALL {0}".format(interval_ms)):
+            normalized_interval_ms = max(250, int(interval_ms))
+            for state in self.esp_node_state.values():
+                state["report_interval_ms"] = normalized_interval_ms
             if log_to_console:
                 self.append_console(">>> [ESP] SETINT ALL {0}".format(interval_ms))
             return True
@@ -3907,6 +3910,20 @@ class ArduinoLoggerApp:
             self.add_smoothed_point(slot_idx, now, temp_cal, hum_cal)
             self.save_to_db(now)
             self._schedule_redraw()
+        elif event_name == "config_ack":
+            try:
+                node_id = int(event.get("node_id"))
+            except Exception:
+                return
+            state = self.esp_node_state.setdefault(node_id, {})
+            try:
+                state["report_interval_ms"] = max(250, int(event.get("report_interval_ms")))
+            except Exception:
+                pass
+            now = self.parse_esp_timestamp(event)
+            state["last_seen_monotonic"] = time.monotonic()
+            state["last_seen_dt"] = now
+            self.update_esp_node_presence(node_id, True, dt=now)
         elif event_name == "rename_ack":
             try:
                 node_id = int(event.get("node_id"))
@@ -3968,10 +3985,10 @@ class ArduinoLoggerApp:
                 except Exception:
                     last_seen_ms = None
                 if last_seen_ms is not None:
-                    state["last_seen_monotonic"] = time.monotonic() - max(0.0, last_seen_ms / 1000.0)
-                    state["last_seen_dt"] = datetime.now()
-                    stale_after_ms = max(5000, state["report_interval_ms"] * 3)
-                    self.update_esp_node_presence(node_id, last_seen_ms <= stale_after_ms, dt=datetime.now())
+                    snapshot_dt = datetime.now()
+                    state["last_seen_monotonic"] = time.monotonic()
+                    state["last_seen_dt"] = snapshot_dt
+                    self.update_esp_node_presence(node_id, True, dt=snapshot_dt)
                 self.update_channel_tree_row(slot_idx, signal_display=self.current_signals[slot_idx])
                 updated_any = True
             if updated_any:

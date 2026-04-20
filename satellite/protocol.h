@@ -4,7 +4,7 @@
 
 namespace proto {
 
-static constexpr uint16_t PROTOCOL_VERSION = 4;
+static constexpr uint16_t PROTOCOL_VERSION = 6;
 static constexpr uint8_t  RADIO_CHANNEL     = 6;   // must match on all nodes
 static constexpr uint32_t DEFAULT_REPORT_MS = 1000;
 static constexpr uint32_t MIN_REPORT_MS     = 500;
@@ -18,6 +18,7 @@ enum MessageType : uint8_t {
     MSG_BIND_REQUEST = 1,
     MSG_BIND_ACK     = 2,
     MSG_READING      = 3,
+    MSG_READING_ACK  = 4,
     MSG_CONFIG_SET   = 5,
     MSG_CONFIG_ACK   = 6,
     MSG_SAMPLE_REQ   = 7,
@@ -46,6 +47,7 @@ enum OtaStatus : uint8_t {
     OTA_STATUS_END_FAILED      = 5,
     OTA_STATUS_CRC_MISMATCH    = 6,
     OTA_STATUS_BUSY            = 7,
+    OTA_STATUS_NOT_READY       = 8,
 };
 
 static constexpr size_t OTA_CHUNK_BYTES = 180;
@@ -72,10 +74,12 @@ struct __attribute__((packed)) BindAck {
     Header header;
     uint32_t assignedNodeId;
     uint32_t reportIntervalMs;
+    uint32_t nextReportDelayMs;
     float tempOffsetC;
     uint8_t controllerMac[6];
     uint8_t accepted;
     uint8_t heaterEnabled;
+    uint8_t otaReady;
     uint16_t sampleRateHz;
 };
 
@@ -89,21 +93,31 @@ struct __attribute__((packed)) Reading {
     uint8_t reserved[2];   // reserved[0]=fwMajor, reserved[1]=fwMinor
 };
 
+struct __attribute__((packed)) ReadingAck {
+    Header header;
+    uint32_t readingSequence;
+    uint8_t accepted;
+    uint8_t reserved[3];
+};
+
 struct __attribute__((packed)) ConfigSet {
     Header header;
     uint32_t reportIntervalMs;
+    uint32_t nextReportDelayMs;
     float tempOffsetC;
     uint8_t heaterEnabled;
+    uint8_t otaReady;
     uint16_t sampleRateHz;
-    uint8_t reserved;
 };
 
 struct __attribute__((packed)) ConfigAck {
     Header header;
     uint32_t reportIntervalMs;
+    uint32_t nextReportDelayMs;
     float tempOffsetC;
     uint8_t applied;
     uint8_t heaterEnabled;
+    uint8_t otaReady;
     uint16_t sampleRateHz;
 };
 
