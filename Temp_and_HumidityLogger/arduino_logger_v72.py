@@ -3608,11 +3608,16 @@ class ArduinoLoggerApp:
         if interval_ms is None:
             self.append_console("Interval ignored: use formats like 500ms, 1s, 2min, 1h")
             return
+        previous_interval_ms = self.parse_interval_ms(self.saved_interval_text)
         if self.source_connected["arduino"] and self.arduino_polling_started:
             self.schedule_arduino_poll(interval_ms)
             self.append_console(">>> [ARD] interval set to {0} ms".format(interval_ms))
         if self.source_connected["esp"]:
             self.apply_esp_interval(interval_ms, log_to_console=True)
+        if previous_interval_ms != interval_ms:
+            self.add_auto_marker("Interval set to {0} ms".format(interval_ms))
+        self.saved_interval_text = interval_text or self.DEFAULT_INTERVAL_TEXT
+        self.save_config()
 
     def schedule_esp_init(self, delay_ms):
         if self.esp_init_job is not None:

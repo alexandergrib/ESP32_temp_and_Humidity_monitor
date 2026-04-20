@@ -133,6 +133,7 @@ Build satellite firmware first, then upload through the controller:
 ```bash
 python -m platformio run -e satellite_upload
 python pc_logger\ota_satellite.py --port COM6 --node-id 1 --firmware .pio\build\satellite_upload\firmware.bin
+python pc_logger\ota_satellite.py --port COM6 --node-id 2 --firmware .pio\build\satellite_upload\firmware.bin
 ```
 
 Run OTA one satellite at a time.

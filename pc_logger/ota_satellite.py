@@ -165,9 +165,18 @@ def wait_for_ota_ready_state(ser: serial.Serial, node_id: int, enabled: bool, ti
         event = read_event(ser, remaining)
         if event is None:
             continue
+        if event.get("event") == "ota_ready" and int(event.get("node_id", 0)) == node_id:
+            if bool(event.get("enabled")) == enabled:
+                return event
         if event.get("event") == "config_ack" and int(event.get("node_id", 0)) == node_id:
             if bool(event.get("ota_ready")) == enabled:
                 return event
+        if event.get("event") == "nodes":
+            for item in event.get("items", []):
+                if int(item.get("node_id", 0)) != node_id:
+                    continue
+                if bool(item.get("ota_ready")) == enabled:
+                    return item
     raise TimeoutError(f"Timed out waiting for node {node_id} ota_ready={enabled}")
 
 
@@ -245,8 +254,12 @@ def main() -> int:
         send_command(ser, "STREAM ON")
         send_command(ser, "BIND")
         read_event(ser, 2.0)
-        wait_for_node_ready(ser, args.node_id, 20.0)
-        snapshot = wait_for_nodes_snapshot(ser, 8.0)
+        ready_event = wait_for_node_ready(ser, args.node_id, 20.0)
+        snapshot: list[dict] = []
+        try:
+            snapshot = wait_for_nodes_snapshot(ser, 8.0)
+        except TimeoutError:
+            print(f"Warning: proceeding without full node snapshot for node {args.node_id}")
         saved_intervals: dict[int, int] = {}
         saved_sleep_enabled: bool | None = None
         target_prepared = False
@@ -259,6 +272,8 @@ def main() -> int:
             quiet_ms = 30000
             send_command(ser, f"SETINT {node_id} {quiet_ms}")
             read_event(ser, 2.0)
+        if saved_sleep_enabled is None:
+            saved_sleep_enabled = bool(ready_event.get("sleep_enabled")) if "sleep_enabled" in ready_event else None
         try:
             send_command(ser, f"SETINT {args.node_id} 30000")
             wait_for_node_ready(ser, args.node_id, 20.0)

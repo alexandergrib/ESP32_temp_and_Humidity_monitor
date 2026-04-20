@@ -21,6 +21,8 @@ static constexpr uint8_t STATUS_LED_PIN = LED_BUILTIN;
 static constexpr uint32_t STATUS_LED_PERIOD_MS = 1000;
 static constexpr uint32_t STATUS_LED_ON_MS = 80;
 static constexpr uint32_t MIN_REPORT_SLOT_GAP_MS = 250;
+static constexpr uint8_t SATELLITE_AVERAGING_WINDOW_PERCENT = 20;
+static constexpr uint32_t SATELLITE_AVERAGING_WINDOW_MAX_MS = 1000;
 static constexpr uint32_t OFFLINE_REPROBE_MS = 2000;
 static constexpr uint32_t OTA_ACK_TIMEOUT_MS = 1500;
 static constexpr uint8_t OTA_MAX_RETRIES = 3;
@@ -50,6 +52,7 @@ struct NodeRecord {
     uint16_t sampleRateHz = DEFAULT_SAMPLE_RATE_HZ;
     float tempOffsetC = 0.0f;
     uint32_t nextReportDelayMs = 0;
+    uint32_t nextScheduledReportAtMs = 0;
     uint32_t lastDeliveredReadingSeq = 0;
 };
 
@@ -97,6 +100,7 @@ void handleIncomingPacket(const uint8_t* mac, const uint8_t* data, int len, int8
 void logSendStatus(esp_now_send_status_t status);
 void rebuildReportSchedule();
 void pushSchedulesToAllNodes();
+uint32_t nextWakeDelayForNode(size_t idx, uint32_t controllerUptimeMs);
 void handleOtaAck(const uint8_t* mac, const OtaAck& ack);
 void handleRenameAck(const uint8_t* mac, const RenameAck& ack);
 void retryPendingOtaFrame();
@@ -112,6 +116,12 @@ uint32_t normalizeReportInterval(uint32_t ms) {
 
 uint16_t normalizeSampleRateHz(uint32_t hz) {
     return static_cast<uint16_t>(constrain(hz, MIN_SAMPLE_RATE_HZ, MAX_SAMPLE_RATE_HZ));
+}
+
+uint32_t satelliteCaptureWindowMs(uint32_t reportIntervalMs) {
+    const uint32_t normalizedReportMs = normalizeReportInterval(reportIntervalMs);
+    const uint32_t scaledWindowMs = (normalizedReportMs * SATELLITE_AVERAGING_WINDOW_PERCENT) / 100U;
+    return min<uint32_t>(normalizedReportMs, max<uint32_t>(1, min<uint32_t>(scaledWindowMs, SATELLITE_AVERAGING_WINDOW_MAX_MS)));
 }
 
 String sanitizeNodeName(String name) {
@@ -341,12 +351,25 @@ bool ensurePeer(const uint8_t* mac) {
     return esp_now_add_peer(&peer) == ESP_OK;
 }
 
-void sendBindAck(const uint8_t* mac, const NodeRecord& node) {
+void alignNodeSchedule(NodeRecord& node, uint32_t nowMs, uint32_t minFutureMs = MIN_REPORT_SLOT_GAP_MS) {
+    const uint32_t cycleMs = normalizeReportInterval(node.reportIntervalMs);
+    const uint32_t earliestSlotAtMs = nowMs + max<uint32_t>(minFutureMs, satelliteCaptureWindowMs(cycleMs));
+    if (node.nextScheduledReportAtMs == 0) {
+        node.nextScheduledReportAtMs = earliestSlotAtMs;
+        return;
+    }
+    while (timeReached(earliestSlotAtMs, node.nextScheduledReportAtMs)) {
+        node.nextScheduledReportAtMs += cycleMs;
+    }
+}
+
+void sendBindAck(const uint8_t* mac, size_t idx) {
+    NodeRecord& node = nodes[idx];
     BindAck ack{};
     fillHeader(ack.header, MSG_BIND_ACK, txSeq++, node.nodeId, millis());
     ack.assignedNodeId = node.nodeId;
     ack.reportIntervalMs = normalizeReportInterval(node.reportIntervalMs);
-    ack.nextReportDelayMs = node.nextReportDelayMs;
+    ack.nextReportDelayMs = nextWakeDelayForNode(idx, ack.header.uptimeMs);
     ack.tempOffsetC = node.tempOffsetC;
     ack.heaterEnabled = node.heaterEnabled ? 1 : 0;
     ack.otaReady = node.otaReady ? 1 : 0;
@@ -373,7 +396,7 @@ void sendConfig(
     ConfigSet cfg{};
     fillHeader(cfg.header, MSG_CONFIG_SET, txSeq++, nodeId, millis());
     cfg.reportIntervalMs = normalizeReportInterval(reportIntervalMs);
-    cfg.nextReportDelayMs = nextReportDelayMs;
+    cfg.nextReportDelayMs = nextWakeDelayForNode(static_cast<size_t>(idx), cfg.header.uptimeMs);
     cfg.tempOffsetC = tempOffsetC;
     cfg.heaterEnabled = heaterEnabled ? 1 : 0;
     cfg.otaReady = otaReady ? 1 : 0;
@@ -428,6 +451,13 @@ void sendReadingAck(size_t idx, uint32_t readingSequence) {
     fillHeader(ack.header, MSG_READING_ACK, txSeq++, nodes[idx].nodeId, millis());
     ack.readingSequence = readingSequence;
     ack.accepted = 1;
+    ack.heaterEnabled = nodes[idx].heaterEnabled ? 1 : 0;
+    ack.otaReady = nodes[idx].otaReady ? 1 : 0;
+    ack.sleepEnabled = nodes[idx].sleepEnabled ? 1 : 0;
+    ack.reportIntervalMs = normalizeReportInterval(nodes[idx].reportIntervalMs);
+    ack.nextReportDelayMs = nextWakeDelayForNode(idx, ack.header.uptimeMs);
+    ack.tempOffsetC = nodes[idx].tempOffsetC;
+    ack.sampleRateHz = normalizeSampleRateHz(nodes[idx].sampleRateHz);
     ensurePeer(nodes[idx].mac);
     esp_now_send(nodes[idx].mac, reinterpret_cast<const uint8_t*>(&ack), sizeof(ack));
 }
@@ -549,6 +579,26 @@ size_t countActiveNodes() {
     return count;
 }
 
+uint32_t nextWakeDelayForNode(size_t idx, uint32_t controllerUptimeMs) {
+    if (idx >= MAX_NODES || !nodes[idx].used) {
+        return MIN_REPORT_SLOT_GAP_MS;
+    }
+
+    NodeRecord& node = nodes[idx];
+    const uint32_t cycleMs = normalizeReportInterval(node.reportIntervalMs);
+    if (cycleMs == 0) {
+        return MIN_REPORT_SLOT_GAP_MS;
+    }
+
+    const uint32_t captureLeadMs = satelliteCaptureWindowMs(cycleMs);
+    alignNodeSchedule(node, controllerUptimeMs);
+
+    if (timeReached(controllerUptimeMs + captureLeadMs, node.nextScheduledReportAtMs)) {
+        return 0;
+    }
+    return node.nextScheduledReportAtMs - controllerUptimeMs - captureLeadMs;
+}
+
 void rebuildReportSchedule() {
     size_t activeCount = countActiveNodes();
     if (activeCount == 0) return;
@@ -558,11 +608,13 @@ void rebuildReportSchedule() {
         cycleMs = max(cycleMs, normalizeReportInterval(node.reportIntervalMs));
     }
     const uint32_t spacingMs = max(MIN_REPORT_SLOT_GAP_MS, cycleMs / activeCount);
+    const uint32_t nowMs = millis();
     uint32_t offsetMs = 0;
     for (NodeRecord& node : nodes) {
         if (!node.used) continue;
         node.reportIntervalMs = cycleMs;
         node.nextReportDelayMs = offsetMs;
+        node.nextScheduledReportAtMs = nowMs + spacingMs + offsetMs;
         offsetMs += spacingMs;
     }
 }
@@ -577,8 +629,9 @@ void pushSchedulesToAllNodes() {
 void handleBindRequest(const uint8_t* mac, const BindRequest& req) {
     int idx = findNodeByMac(mac);
     bool isNewNode = false;
+    const uint32_t nowMs = millis();
     if (idx < 0) {
-        if (!bindWindowOpen || millis() > bindWindowEndsAt) {
+        if (!bindWindowOpen || nowMs > bindWindowEndsAt) {
             return;
         }
         idx = allocateNodeSlot();
@@ -592,6 +645,7 @@ void handleBindRequest(const uint8_t* mac, const BindRequest& req) {
         memcpy(nodes[idx].mac, mac, 6);
         prefs.putUInt("nextNodeId", nextNodeId);
     }
+    bool shouldRebuildSchedule = isNewNode || nodeNeedsFastProbe(nodes[idx], nowMs);
 
     sanitizeNodeName(String(req.nodeName)).toCharArray(nodes[idx].name, sizeof(nodes[idx].name));
     nodes[idx].fwMajor = req.fwMajor;
@@ -600,11 +654,15 @@ void handleBindRequest(const uint8_t* mac, const BindRequest& req) {
         nodes[idx].reportIntervalMs = DEFAULT_REPORT_MS;
         nodes[idx].sampleRateHz = DEFAULT_SAMPLE_RATE_HZ;
     }
-    nodes[idx].lastSeenMs = millis();
+    nodes[idx].lastSeenMs = nowMs;
     saveNode(idx);
-    rebuildReportSchedule();
-    sendBindAck(mac, nodes[idx]);
-    pushSchedulesToAllNodes();
+    if (shouldRebuildSchedule) {
+        rebuildReportSchedule();
+    }
+    sendBindAck(mac, static_cast<size_t>(idx));
+    if (shouldRebuildSchedule) {
+        pushSchedulesToAllNodes();
+    }
 
     printJsonEvent(
         "{\"event\":\"node_bound\",\"node_id\":" + String(nodes[idx].nodeId) +

@@ -48,12 +48,14 @@ static constexpr float SENSOR_MAX_VALID_TEMP_C = 125.0f;
 static constexpr float SENSOR_MIN_VALID_HUMIDITY_PCT = 0.0f;
 static constexpr float SENSOR_MAX_VALID_HUMIDITY_PCT = 100.0f;
 static constexpr uint8_t SENSOR_AVERAGING_WINDOW_PERCENT = 20;
-static constexpr uint32_t SENSOR_MIN_AVERAGING_WINDOW_MS = 100;
-static constexpr uint32_t SENSOR_MAX_AVERAGING_WINDOW_MS = 10000;
+static constexpr uint32_t SENSOR_AVERAGING_WINDOW_MAX_MS = 1000;
 static constexpr uint32_t READING_ACK_TIMEOUT_MS = 250;
 static constexpr uint32_t READING_RETRY_BACKOFF_MS = 150;
 static constexpr uint8_t READING_MAX_RETRIES = 3;
 static constexpr uint32_t CONTROLLER_AWAKE_WINDOW_MS = 5000;
+static constexpr uint32_t SETTINGS_SYNC_WAKE_THRESHOLD_MS = 2000;
+static constexpr uint32_t SETTINGS_SYNC_RETRY_MS = 1500;
+static constexpr uint32_t SETTINGS_SYNC_AWAKE_WINDOW_MS = 1500;
 static constexpr uint32_t UNBOUND_SLEEP_MS = 250;
 static constexpr size_t READING_BUFFER_CAPACITY = 8;
 static constexpr size_t SENSOR_ROLLING_CHUNK_CAPACITY = 1024;
@@ -82,9 +84,13 @@ uint32_t lastGoodSampleAtUs = 0;
 bool otaRebootPending = false;
 uint32_t otaRebootAtMs = 0;
 uint32_t nextReportDueAtMs = 0;
+bool captureWindowActive = false;
+uint32_t captureWindowEndsAtMs = 0;
 uint32_t controllerAwakeUntilMs = 0;
 uint32_t lastControllerContactAtMs = 0;
 uint32_t lastRecoveryBindAttemptAtMs = 0;
+bool pendingSettingsSync = false;
+uint32_t lastSettingsSyncRequestAtMs = 0;
 
 struct SatelliteOtaState {
     bool active = false;
@@ -137,8 +143,23 @@ void handleIncomingPacket(const uint8_t* data, int len);
 void logSendStatus(esp_now_send_status_t status);
 void pumpSensorSampling();
 void maintainControllerLink();
+void maybeRequestSettingsSync();
 bool initEspNowRadio();
 bool resetEspNowRadioAfterWake();
+void applyControllerState(
+    uint32_t reportMs,
+    uint32_t nextDelayMs,
+    float tempOffset,
+    bool heaterOn,
+    bool otaReadyEnabled,
+    bool sleepEnabledState,
+    uint16_t sampleRate,
+    bool persistConfig
+);
+void beginCaptureWindow();
+void completeCaptureWindow();
+void captureScheduledReading();
+void saveConfig();
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
 void onDataRecv(const esp_now_recv_info_t*, const uint8_t* data, int len);
 void onDataSent(const wifi_tx_info_t*, esp_now_send_status_t status);
@@ -265,13 +286,17 @@ bool canReuseLastSampleForChunk(uint32_t nowUs) {
            (nowUs - lastGoodSampleAtUs) <= max(SENSOR_EMPTY_CHUNK_FILL_MAX_AGE_US, samplePeriodUs() * 2U);
 }
 
-uint32_t averagingWindowMs() {
-    const uint32_t reportMs = normalizeReportInterval(reportIntervalMs);
-    const uint32_t scaledWindowMs = max<uint32_t>(
-        SENSOR_MIN_AVERAGING_WINDOW_MS,
-        (reportMs * SENSOR_AVERAGING_WINDOW_PERCENT) / 100U
+uint32_t captureWindowMs() {
+    const uint32_t normalizedReportMs = normalizeReportInterval(reportIntervalMs);
+    const uint32_t scaledWindowMs = (normalizedReportMs * SENSOR_AVERAGING_WINDOW_PERCENT) / 100U;
+    return min<uint32_t>(
+        normalizedReportMs,
+        max<uint32_t>(1, min<uint32_t>(scaledWindowMs, SENSOR_AVERAGING_WINDOW_MAX_MS))
     );
-    return min<uint32_t>(scaledWindowMs, SENSOR_MAX_AVERAGING_WINDOW_MS);
+}
+
+uint32_t averagingWindowMs() {
+    return captureWindowMs();
 }
 
 uint32_t averagingWindowUs() {
@@ -477,6 +502,61 @@ bool enqueueBufferedReading(float temperatureC, float humidityPct, bool sensorOk
 
 void scheduleNextReport(uint32_t delayMs) {
     nextReportDueAtMs = millis() + max<uint32_t>(delayMs, 25);
+}
+
+void applyControllerState(
+    uint32_t reportMs,
+    uint32_t nextDelayMs,
+    float tempOffset,
+    bool heaterOn,
+    bool otaReadyEnabled,
+    bool sleepEnabledState,
+    uint16_t sampleRate,
+    bool persistConfig
+) {
+    const uint32_t normalizedReportMs = normalizeReportInterval(reportMs);
+    const uint16_t normalizedSampleRate = normalizeSampleRateHz(sampleRate);
+    const bool configChanged =
+        reportIntervalMs != normalizedReportMs ||
+        sampleRateHz != normalizedSampleRate ||
+        tempOffsetC != tempOffset ||
+        heaterEnabled != heaterOn ||
+        otaReady != otaReadyEnabled ||
+        sleepEnabled != sleepEnabledState;
+
+    reportIntervalMs = normalizedReportMs;
+    sampleRateHz = normalizedSampleRate;
+    tempOffsetC = tempOffset;
+    heaterEnabled = heaterOn;
+    otaReady = otaReadyEnabled;
+    sleepEnabled = sleepEnabledState;
+    applySensorConfig();
+    restartSensorSampler(true);
+    captureWindowActive = false;
+    captureWindowEndsAtMs = 0;
+    scheduleNextReport(nextDelayMs);
+    lastControllerContactAtMs = millis();
+    lastRecoveryBindAttemptAtMs = 0;
+    pendingSettingsSync = false;
+    lastSettingsSyncRequestAtMs = 0;
+    if (persistConfig || configChanged) {
+        saveConfig();
+    }
+}
+
+void beginCaptureWindow() {
+    captureWindowActive = true;
+    captureWindowEndsAtMs = millis() + captureWindowMs();
+    restartSensorSampler(true);
+    stayAwakeForController(captureWindowMs() + READING_ACK_TIMEOUT_MS + READING_RETRY_BACKOFF_MS);
+}
+
+void completeCaptureWindow() {
+    captureWindowActive = false;
+    captureWindowEndsAtMs = 0;
+    captureScheduledReading();
+    scheduleNextReport(normalizeReportInterval(reportIntervalMs));
+    stayAwakeForController(READING_ACK_TIMEOUT_MS + READING_RETRY_BACKOFF_MS + 500);
 }
 
 void captureScheduledReading() {
@@ -720,6 +800,16 @@ void handleReadingAck(const ReadingAck& ack) {
         return;
     }
     dropOldestBufferedReading();
+    applyControllerState(
+        ack.reportIntervalMs,
+        ack.nextReportDelayMs,
+        ack.tempOffsetC,
+        ack.heaterEnabled != 0,
+        ack.otaReady != 0,
+        ack.sleepEnabled != 0,
+        ack.sampleRateHz,
+        false
+    );
     stayAwakeForController();
 }
 
@@ -842,20 +932,18 @@ void handleIncomingPacket(const uint8_t* data, int len) {
         if (!ack->accepted) return;
         memcpy(controllerMac, ack->controllerMac, 6);
         nodeId = ack->assignedNodeId;
-        reportIntervalMs = normalizeReportInterval(ack->reportIntervalMs);
-        sampleRateHz = normalizeSampleRateHz(ack->sampleRateHz);
-        tempOffsetC = ack->tempOffsetC;
-        heaterEnabled = ack->heaterEnabled != 0;
-        otaReady = ack->otaReady != 0;
-        sleepEnabled = ack->sleepEnabled != 0;
-        applySensorConfig();
-        restartSensorSampler(true);
         isBound = true;
         ensurePeer(controllerMac);
-        scheduleNextReport(ack->nextReportDelayMs);
-        lastControllerContactAtMs = millis();
-        lastRecoveryBindAttemptAtMs = 0;
-        saveConfig();
+        applyControllerState(
+            ack->reportIntervalMs,
+            ack->nextReportDelayMs,
+            ack->tempOffsetC,
+            ack->heaterEnabled != 0,
+            ack->otaReady != 0,
+            ack->sleepEnabled != 0,
+            ack->sampleRateHz,
+            true
+        );
         Serial.printf(
             "Bound to controller %s as node %lu fw %u.%u heater %s sample %uHz\n",
             macToString(controllerMac).c_str(),
@@ -868,18 +956,16 @@ void handleIncomingPacket(const uint8_t* data, int len) {
         noteActivity();
     } else if (h->type == MSG_CONFIG_SET && len == sizeof(ConfigSet)) {
         const ConfigSet* cfg = reinterpret_cast<const ConfigSet*>(data);
-        reportIntervalMs = normalizeReportInterval(cfg->reportIntervalMs);
-        sampleRateHz = normalizeSampleRateHz(cfg->sampleRateHz);
-        tempOffsetC = cfg->tempOffsetC;
-        heaterEnabled = cfg->heaterEnabled != 0;
-        otaReady = cfg->otaReady != 0;
-        sleepEnabled = cfg->sleepEnabled != 0;
-        applySensorConfig();
-        restartSensorSampler(true);
-        scheduleNextReport(cfg->nextReportDelayMs);
-        lastControllerContactAtMs = millis();
-        lastRecoveryBindAttemptAtMs = 0;
-        saveConfig();
+        applyControllerState(
+            cfg->reportIntervalMs,
+            cfg->nextReportDelayMs,
+            cfg->tempOffsetC,
+            cfg->heaterEnabled != 0,
+            cfg->otaReady != 0,
+            cfg->sleepEnabled != 0,
+            cfg->sampleRateHz,
+            true
+        );
         sendConfigAck(true);
         noteActivity();
     } else if (h->type == MSG_READING_ACK && len == sizeof(ReadingAck) && isBound) {
@@ -924,6 +1010,24 @@ void maintainControllerLink() {
     Serial.println("Controller contact stale, rebinding...");
 }
 
+void maybeRequestSettingsSync() {
+    if (!isBound || otaState.active || otaReady) {
+        return;
+    }
+    if (!pendingSettingsSync) {
+        return;
+    }
+
+    const uint32_t nowMs = millis();
+    if (!timeReachedMs(nowMs, lastSettingsSyncRequestAtMs + SETTINGS_SYNC_RETRY_MS)) {
+        return;
+    }
+
+    lastSettingsSyncRequestAtMs = nowMs;
+    sendBindRequest();
+    stayAwakeForController(SETTINGS_SYNC_AWAKE_WINDOW_MS);
+}
+
 void logSendStatus(esp_now_send_status_t status) {
     if (status != ESP_NOW_SEND_SUCCESS) {
         Serial.println("Last send: fail");
@@ -934,14 +1038,11 @@ void queueScheduledReadingsIfDue() {
     if (!isBound || otaState.active) {
         return;
     }
-    uint32_t nowMs = millis();
-    while (timeReachedMs(nowMs, nextReportDueAtMs)) {
-        captureScheduledReading();
-        nextReportDueAtMs += normalizeReportInterval(reportIntervalMs);
-        nowMs = millis();
-        if (readingBufferCount >= READING_BUFFER_CAPACITY) {
-            break;
-        }
+    if (captureWindowActive || readingBufferCount >= READING_BUFFER_CAPACITY) {
+        return;
+    }
+    if (timeReachedMs(millis(), nextReportDueAtMs)) {
+        beginCaptureWindow();
     }
 }
 
@@ -984,6 +1085,9 @@ void lightSleepForMs(uint32_t sleepMs) {
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
     resetEspNowRadioAfterWake();
     stayAwakeForController(200);
+    if (isBound && sleepMs >= SETTINGS_SYNC_WAKE_THRESHOLD_MS) {
+        pendingSettingsSync = true;
+    }
 }
 
 void maybeSleep() {
@@ -1005,16 +1109,21 @@ void maybeSleep() {
         return;
     }
 
+    if (captureWindowActive) {
+        return;
+    }
+
     uint32_t nextWakeAtMs = nextReportDueAtMs;
     if (BufferedReading* pending = oldestBufferedReading()) {
-        uint32_t retryAtMs = pending->lastSendAtMs == 0
-            ? nowMs
-            : pending->lastSendAtMs + READING_ACK_TIMEOUT_MS + READING_RETRY_BACKOFF_MS;
-        if (pending->retryCount >= READING_MAX_RETRIES) {
-            retryAtMs = pending->lastSendAtMs + max<uint32_t>(normalizeReportInterval(reportIntervalMs), READING_ACK_TIMEOUT_MS);
+        const uint32_t staleAfterMs = max<uint32_t>(15000, normalizeReportInterval(reportIntervalMs) * 3U);
+        if (!timeReachedMs(nowMs, lastControllerContactAtMs + staleAfterMs)) {
+            return;
         }
-        if (timeReachedMs(nextWakeAtMs, retryAtMs)) {
-            nextWakeAtMs = retryAtMs;
+        const uint32_t fallbackWakeAtMs = pending->lastSendAtMs == 0
+            ? (nowMs + MIN_REPORT_MS)
+            : (pending->lastSendAtMs + normalizeReportInterval(reportIntervalMs));
+        if (timeReachedMs(nextWakeAtMs, fallbackWakeAtMs)) {
+            nextWakeAtMs = fallbackWakeAtMs;
         }
     }
 
@@ -1095,9 +1204,8 @@ void loop() {
         ESP.restart();
     }
 
-    pumpSensorSampling();
-
     if (!isBound) {
+        pumpSensorSampling();
         static uint32_t lastBindAttemptAt = 0;
         if (millis() - lastBindAttemptAt >= 3000) {
             lastBindAttemptAt = millis();
@@ -1110,6 +1218,13 @@ void loop() {
     }
 
     maintainControllerLink();
+    maybeRequestSettingsSync();
+    if (captureWindowActive) {
+        pumpSensorSampling();
+        if (timeReachedMs(millis(), captureWindowEndsAtMs)) {
+            completeCaptureWindow();
+        }
+    }
     queueScheduledReadingsIfDue();
     serviceReadingDelivery();
     maybeSleep();
