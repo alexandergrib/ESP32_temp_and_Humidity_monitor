@@ -19,6 +19,7 @@ static constexpr char DEFAULT_NODE_NAME[] = "satellite";
 static constexpr uint8_t FW_VERSION_MAJOR = 2;
 static constexpr uint8_t FW_VERSION_MINOR = 5;
 static constexpr uint32_t SATELLITE_CPU_FREQ_MHZ = 80;
+static constexpr bool DEBUG_FORCE_NO_SLEEP = false;
 
 #ifndef LED_BUILTIN
 static constexpr uint8_t STATUS_LED_PIN = 2;
@@ -46,13 +47,16 @@ static constexpr float SENSOR_MIN_VALID_TEMP_C = -40.0f;
 static constexpr float SENSOR_MAX_VALID_TEMP_C = 125.0f;
 static constexpr float SENSOR_MIN_VALID_HUMIDITY_PCT = 0.0f;
 static constexpr float SENSOR_MAX_VALID_HUMIDITY_PCT = 100.0f;
-static constexpr uint32_t READING_BURST_MS = 180;
+static constexpr uint8_t SENSOR_AVERAGING_WINDOW_PERCENT = 20;
+static constexpr uint32_t SENSOR_MIN_AVERAGING_WINDOW_MS = 100;
+static constexpr uint32_t SENSOR_MAX_AVERAGING_WINDOW_MS = 10000;
 static constexpr uint32_t READING_ACK_TIMEOUT_MS = 250;
 static constexpr uint32_t READING_RETRY_BACKOFF_MS = 150;
 static constexpr uint8_t READING_MAX_RETRIES = 3;
 static constexpr uint32_t CONTROLLER_AWAKE_WINDOW_MS = 5000;
 static constexpr uint32_t UNBOUND_SLEEP_MS = 250;
 static constexpr size_t READING_BUFFER_CAPACITY = 8;
+static constexpr size_t SENSOR_ROLLING_CHUNK_CAPACITY = 1024;
 
 Preferences prefs;
 SHT85 sht(SHT_DEFAULT_ADDRESS);
@@ -68,6 +72,7 @@ bool statusLedOn = false;
 float tempOffsetC = 0.0f;
 bool heaterEnabled = false;
 bool otaReady = false;
+bool sleepEnabled = false;
 uint32_t activityLedUntilMs = 0;
 
 bool sensorPresent = false;
@@ -102,10 +107,13 @@ struct SensorSamplerState {
     float chunkTempSum = 0.0f;
     float chunkHumiditySum = 0.0f;
     uint16_t chunkSampleCount = 0;
-    float bufferedChunkTempSum = 0.0f;
-    float bufferedChunkHumiditySum = 0.0f;
-    uint32_t bufferedChunkCount = 0;
 } sensorSampler;
+
+struct RollingChunk {
+    uint32_t endedAtUs = 0;
+    float temperatureC = NAN;
+    float humidityPct = NAN;
+};
 
 struct BufferedReading {
     bool used = false;
@@ -121,11 +129,23 @@ struct BufferedReading {
 BufferedReading readingBuffer[READING_BUFFER_CAPACITY];
 size_t readingBufferHead = 0;
 size_t readingBufferCount = 0;
+RollingChunk rollingChunks[SENSOR_ROLLING_CHUNK_CAPACITY];
+size_t rollingChunkHead = 0;
+size_t rollingChunkCount = 0;
 
 void handleIncomingPacket(const uint8_t* data, int len);
 void logSendStatus(esp_now_send_status_t status);
 void pumpSensorSampling();
 void maintainControllerLink();
+bool initEspNowRadio();
+bool resetEspNowRadioAfterWake();
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+void onDataRecv(const esp_now_recv_info_t*, const uint8_t* data, int len);
+void onDataSent(const wifi_tx_info_t*, esp_now_send_status_t status);
+#else
+void onDataRecv(const uint8_t*, const uint8_t* data, int len);
+void onDataSent(const uint8_t*, esp_now_send_status_t status);
+#endif
 
 void noteActivity() {
     activityLedUntilMs = millis() + STATUS_LED_ACTIVITY_MS;
@@ -245,10 +265,52 @@ bool canReuseLastSampleForChunk(uint32_t nowUs) {
            (nowUs - lastGoodSampleAtUs) <= max(SENSOR_EMPTY_CHUNK_FILL_MAX_AGE_US, samplePeriodUs() * 2U);
 }
 
+uint32_t averagingWindowMs() {
+    const uint32_t reportMs = normalizeReportInterval(reportIntervalMs);
+    const uint32_t scaledWindowMs = max<uint32_t>(
+        SENSOR_MIN_AVERAGING_WINDOW_MS,
+        (reportMs * SENSOR_AVERAGING_WINDOW_PERCENT) / 100U
+    );
+    return min<uint32_t>(scaledWindowMs, SENSOR_MAX_AVERAGING_WINDOW_MS);
+}
+
+uint32_t averagingWindowUs() {
+    return averagingWindowMs() * 1000UL;
+}
+
 void clearBufferedChunks() {
-    sensorSampler.bufferedChunkTempSum = 0.0f;
-    sensorSampler.bufferedChunkHumiditySum = 0.0f;
-    sensorSampler.bufferedChunkCount = 0;
+    rollingChunkHead = 0;
+    rollingChunkCount = 0;
+}
+
+void trimRollingChunks(uint32_t nowUs) {
+    const uint32_t windowUs = averagingWindowUs();
+    while (rollingChunkCount > 0) {
+        const RollingChunk& chunk = rollingChunks[rollingChunkHead];
+        if (!timeReachedUs(nowUs, chunk.endedAtUs)) {
+            break;
+        }
+        if ((nowUs - chunk.endedAtUs) <= windowUs) {
+            break;
+        }
+        rollingChunks[rollingChunkHead] = RollingChunk{};
+        rollingChunkHead = (rollingChunkHead + 1U) % SENSOR_ROLLING_CHUNK_CAPACITY;
+        rollingChunkCount--;
+    }
+}
+
+void pushRollingChunk(float temperatureC, float humidityPct, uint32_t endedAtUs) {
+    trimRollingChunks(endedAtUs);
+    if (rollingChunkCount >= SENSOR_ROLLING_CHUNK_CAPACITY) {
+        rollingChunks[rollingChunkHead] = RollingChunk{};
+        rollingChunkHead = (rollingChunkHead + 1U) % SENSOR_ROLLING_CHUNK_CAPACITY;
+        rollingChunkCount--;
+    }
+    const size_t insertIndex = (rollingChunkHead + rollingChunkCount) % SENSOR_ROLLING_CHUNK_CAPACITY;
+    rollingChunks[insertIndex].endedAtUs = endedAtUs;
+    rollingChunks[insertIndex].temperatureC = temperatureC;
+    rollingChunks[insertIndex].humidityPct = humidityPct;
+    rollingChunkCount++;
 }
 
 void resetCurrentChunk() {
@@ -301,14 +363,15 @@ void noteSamplingSuccess() {
 }
 
 void finalizeCurrentChunk() {
+    const uint32_t chunkEndedAtUs = sensorSampler.chunkStartedAtUs + SENSOR_CHUNK_US;
     if (sensorSampler.chunkSampleCount > 0) {
-        sensorSampler.bufferedChunkTempSum += sensorSampler.chunkTempSum / sensorSampler.chunkSampleCount;
-        sensorSampler.bufferedChunkHumiditySum += sensorSampler.chunkHumiditySum / sensorSampler.chunkSampleCount;
-        sensorSampler.bufferedChunkCount++;
-    } else if (canReuseLastSampleForChunk(sensorSampler.chunkStartedAtUs + SENSOR_CHUNK_US)) {
-        sensorSampler.bufferedChunkTempSum += lastTempC;
-        sensorSampler.bufferedChunkHumiditySum += lastHumidity;
-        sensorSampler.bufferedChunkCount++;
+        pushRollingChunk(
+            sensorSampler.chunkTempSum / sensorSampler.chunkSampleCount,
+            sensorSampler.chunkHumiditySum / sensorSampler.chunkSampleCount,
+            chunkEndedAtUs
+        );
+    } else if (canReuseLastSampleForChunk(chunkEndedAtUs)) {
+        pushRollingChunk(lastTempC, lastHumidity, chunkEndedAtUs);
     }
     resetCurrentChunk();
 }
@@ -339,15 +402,30 @@ void recordSensorSample(float temperatureC, float humidityPct) {
 bool prepareReadingSnapshot(float& temperatureC, float& humidityPct, bool& sensorOk) {
     const uint32_t nowUs = micros();
     rollChunkWindows(nowUs);
+    trimRollingChunks(nowUs);
 
-    if (sensorSampler.bufferedChunkCount > 0) {
-        const float bufferedTemperatureC = sensorSampler.bufferedChunkTempSum / sensorSampler.bufferedChunkCount;
-        const float bufferedHumidityPct = sensorSampler.bufferedChunkHumiditySum / sensorSampler.bufferedChunkCount;
-        if (isValidSensorSample(bufferedTemperatureC, bufferedHumidityPct)) {
-            temperatureC = bufferedTemperatureC;
-            humidityPct = bufferedHumidityPct;
-            sensorOk = true;
-            return true;
+    if (rollingChunkCount > 0) {
+        float rollingTemperatureSum = 0.0f;
+        float rollingHumiditySum = 0.0f;
+        size_t rollingCount = 0;
+        for (size_t i = 0; i < rollingChunkCount; ++i) {
+            const RollingChunk& chunk = rollingChunks[(rollingChunkHead + i) % SENSOR_ROLLING_CHUNK_CAPACITY];
+            if (!isValidSensorSample(chunk.temperatureC, chunk.humidityPct)) {
+                continue;
+            }
+            rollingTemperatureSum += chunk.temperatureC;
+            rollingHumiditySum += chunk.humidityPct;
+            rollingCount++;
+        }
+        if (rollingCount > 0) {
+            const float rollingTemperatureC = rollingTemperatureSum / rollingCount;
+            const float rollingHumidityPct = rollingHumiditySum / rollingCount;
+            if (isValidSensorSample(rollingTemperatureC, rollingHumidityPct)) {
+                temperatureC = rollingTemperatureC;
+                humidityPct = rollingHumidityPct;
+                sensorOk = true;
+                return true;
+            }
         }
     }
 
@@ -402,13 +480,6 @@ void scheduleNextReport(uint32_t delayMs) {
 }
 
 void captureScheduledReading() {
-    restartSensorSampler(true);
-    const uint32_t startedAtMs = millis();
-    while (!timeReachedMs(millis(), startedAtMs + READING_BURST_MS)) {
-        pumpSensorSampling();
-        delay(1);
-    }
-
     float temperatureC = NAN;
     float humidityPct = NAN;
     bool sensorOk = false;
@@ -416,7 +487,6 @@ void captureScheduledReading() {
     if (!enqueueBufferedReading(temperatureC, humidityPct, sensorOk)) {
         Serial.println("Reading buffer full, keeping oldest unsent data");
     }
-    clearBufferedChunks();
 }
 
 void markSampleRequestScheduled(uint32_t nowUs) {
@@ -455,6 +525,7 @@ void saveConfig() {
     prefs.putUShort("sampleHz", normalizeSampleRateHz(sampleRateHz));
     prefs.putFloat("tempOff", tempOffsetC);
     prefs.putBool("heaterOn", heaterEnabled);
+    prefs.putBool("sleepEn", sleepEnabled);
     prefs.putBytes("ctrlMac", controllerMac, 6);
     prefs.putString("name", String(nodeName));
     prefs.end();
@@ -468,6 +539,7 @@ void loadConfig() {
     sampleRateHz = normalizeSampleRateHz(prefs.getUShort("sampleHz", DEFAULT_SAMPLE_RATE_HZ));
     tempOffsetC = prefs.getFloat("tempOff", 0.0f);
     heaterEnabled = prefs.getBool("heaterOn", false);
+    sleepEnabled = prefs.getBool("sleepEn", false);
     prefs.getBytes("ctrlMac", controllerMac, 6);
     String name = prefs.getString("name", DEFAULT_NODE_NAME);
     sanitizeNodeName(name).toCharArray(nodeName, sizeof(nodeName));
@@ -482,6 +554,39 @@ bool ensurePeer(const uint8_t* mac) {
     peer.channel = RADIO_CHANNEL;
     peer.encrypt = false;
     return esp_now_add_peer(&peer) == ESP_OK;
+}
+
+bool initEspNowRadio() {
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_channel(RADIO_CHANNEL, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_promiscuous(false);
+
+    if (esp_now_init() != ESP_OK) {
+        return false;
+    }
+
+    esp_now_register_recv_cb(onDataRecv);
+    esp_now_register_send_cb(onDataSent);
+    return true;
+}
+
+bool resetEspNowRadioAfterWake() {
+    esp_now_deinit();
+    WiFi.mode(WIFI_OFF);
+    delay(2);
+
+    if (!initEspNowRadio()) {
+        Serial.println("ESP-NOW reinit failed after wake");
+        return false;
+    }
+
+    if (isBound) {
+        ensurePeer(controllerMac);
+    }
+    return true;
 }
 
 bool initSensor() {
@@ -588,6 +693,7 @@ void sendConfigAck(bool applied) {
     msg.applied = applied ? 1 : 0;
     msg.heaterEnabled = heaterEnabled ? 1 : 0;
     msg.otaReady = otaReady ? 1 : 0;
+    msg.sleepEnabled = sleepEnabled ? 1 : 0;
     msg.sampleRateHz = normalizeSampleRateHz(sampleRateHz);
     ensurePeer(controllerMac);
     esp_now_send(controllerMac, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
@@ -741,6 +847,7 @@ void handleIncomingPacket(const uint8_t* data, int len) {
         tempOffsetC = ack->tempOffsetC;
         heaterEnabled = ack->heaterEnabled != 0;
         otaReady = ack->otaReady != 0;
+        sleepEnabled = ack->sleepEnabled != 0;
         applySensorConfig();
         restartSensorSampler(true);
         isBound = true;
@@ -766,6 +873,7 @@ void handleIncomingPacket(const uint8_t* data, int len) {
         tempOffsetC = cfg->tempOffsetC;
         heaterEnabled = cfg->heaterEnabled != 0;
         otaReady = cfg->otaReady != 0;
+        sleepEnabled = cfg->sleepEnabled != 0;
         applySensorConfig();
         restartSensorSampler(true);
         scheduleNextReport(cfg->nextReportDelayMs);
@@ -873,9 +981,16 @@ void lightSleepForMs(uint32_t sleepMs) {
     }
     esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(sleepMs) * 1000ULL);
     esp_light_sleep_start();
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    resetEspNowRadioAfterWake();
+    stayAwakeForController(200);
 }
 
 void maybeSleep() {
+    if (DEBUG_FORCE_NO_SLEEP || !sleepEnabled) {
+        return;
+    }
+
     if (otaState.active || otaRebootPending || otaReady) {
         return;
     }
@@ -931,29 +1046,27 @@ void setup() {
     const bool cpuFreqApplied = setCpuFrequencyMhz(SATELLITE_CPU_FREQ_MHZ);
     Serial.begin(SERIAL_BAUD);
     delay(500);
+    loadConfig();
     Serial.printf(
         "Satellite CPU frequency: %u MHz%s\n",
         static_cast<unsigned>(getCpuFrequencyMhz()),
         cpuFreqApplied ? "" : " (requested change failed)"
     );
+    if (DEBUG_FORCE_NO_SLEEP) {
+        Serial.println("DEBUG_FORCE_NO_SLEEP enabled: light sleep disabled");
+    } else {
+        Serial.printf(
+            "Sleep mode: %s\n",
+            sleepEnabled ? "enabled" : "disabled"
+        );
+    }
     initStatusLed();
-
-    loadConfig();
     sensorPresent = initSensor();
 
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    esp_wifi_set_promiscuous(true);
-    esp_wifi_set_channel(RADIO_CHANNEL, WIFI_SECOND_CHAN_NONE);
-    esp_wifi_set_promiscuous(false);
-
-    if (esp_now_init() != ESP_OK) {
+    if (!initEspNowRadio()) {
         Serial.println("ESP-NOW init failed");
         return;
     }
-
-    esp_now_register_recv_cb(onDataRecv);
-    esp_now_register_send_cb(onDataSent);
 
     if (isBound) {
         ensurePeer(controllerMac);
@@ -981,6 +1094,8 @@ void loop() {
     if (otaRebootPending && static_cast<int32_t>(millis() - otaRebootAtMs) >= 0) {
         ESP.restart();
     }
+
+    pumpSensorSampling();
 
     if (!isBound) {
         static uint32_t lastBindAttemptAt = 0;

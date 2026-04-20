@@ -23,7 +23,7 @@ import matplotlib.dates as mdates
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.dates import AutoDateLocator, ConciseDateFormatter
 from matplotlib.figure import Figure
-from matplotlib.ticker import AutoMinorLocator, MultipleLocator, NullLocator
+from matplotlib.ticker import AutoMinorLocator, NullFormatter, NullLocator
 
 
 class ArduinoLoggerApp:
@@ -81,6 +81,10 @@ class ArduinoLoggerApp:
         self.terminal_visible = True
         self.terminal_window = None
         self.floating_console_text = None
+        self.terminal_command_var = tk.StringVar(value="")
+        self.terminal_command_target_var = tk.StringVar(value="ESP")
+        self.terminal_command_entry = None
+        self.floating_terminal_command_entry = None
         self.markers_window = None
         self.floating_markers_listbox = None
         self.floating_markers_scrollbar = None
@@ -1408,14 +1412,10 @@ class ArduinoLoggerApp:
             self.tree.tag_configure(tag, foreground=self.channel_colors[i])
         self.rebuild_channel_tree()
 
-        tk.Label(self.live_right, text="Terminal", font=("Segoe UI", 10, "bold")).pack(
-            anchor="w", padx=8, pady=(8, 4)
+        self.txt_console = self._build_terminal_panel(
+            self.live_right,
+            entry_attr_name="terminal_command_entry"
         )
-        self.txt_console = tk.Text(
-            self.live_right, height=10, bg="black", fg="lime",
-            font=("Consolas", 9), wrap="word"
-        )
-        self.txt_console.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
         self.build_graph_tab(self.tab_graph, "temp")
         self.build_graph_tab(self.tab_humidity_graph, "hum")
@@ -1740,6 +1740,37 @@ class ArduinoLoggerApp:
         except Exception:
             pass
 
+    def _build_terminal_panel(self, parent, entry_attr_name):
+        tk.Label(parent, text="Terminal", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=8, pady=(8, 4)
+        )
+        console_text = tk.Text(
+            parent, height=10, bg="black", fg="lime",
+            font=("Consolas", 9), wrap="word"
+        )
+        console_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 6))
+
+        command_row = tk.Frame(parent)
+        command_row.pack(fill=tk.X, padx=8, pady=(0, 8))
+
+        target_combo = ttk.Combobox(
+            command_row,
+            width=5,
+            state="readonly",
+            values=("ESP", "ARD"),
+            textvariable=self.terminal_command_target_var
+        )
+        target_combo.pack(side=tk.LEFT, padx=(0, 6))
+
+        entry = tk.Entry(command_row, textvariable=self.terminal_command_var)
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        entry.bind("<Return>", self.send_terminal_command)
+
+        tk.Button(command_row, text="Send", width=8, command=self.send_terminal_command).pack(side=tk.LEFT)
+
+        setattr(self, entry_attr_name, entry)
+        return console_text
+
     def _create_floating_terminal_window(self):
         if self.terminal_window is not None and self.terminal_window.winfo_exists():
             self.terminal_window.deiconify()
@@ -1751,14 +1782,10 @@ class ArduinoLoggerApp:
         self.terminal_window.geometry("680x320")
         self.terminal_window.transient(self.root)
 
-        tk.Label(self.terminal_window, text="Terminal", font=("Segoe UI", 10, "bold")).pack(
-            anchor="w", padx=8, pady=(8, 4)
+        self.floating_console_text = self._build_terminal_panel(
+            self.terminal_window,
+            entry_attr_name="floating_terminal_command_entry"
         )
-        self.floating_console_text = tk.Text(
-            self.terminal_window, height=10, bg="black", fg="lime",
-            font=("Consolas", 9), wrap="word"
-        )
-        self.floating_console_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         try:
             existing_text = self.txt_console.get("1.0", tk.END)
             if existing_text:
@@ -1777,6 +1804,7 @@ class ArduinoLoggerApp:
                 pass
         self.terminal_window = None
         self.floating_console_text = None
+        self.floating_terminal_command_entry = None
 
     def _on_terminal_window_close(self):
         self.terminal_mode = "docked"
@@ -2452,14 +2480,17 @@ class ArduinoLoggerApp:
             return
         for ctx in self.graph_contexts.values():
             ax = ctx["ax"]
+            ax.set_axisbelow(True)
             ax.grid(True, which="major", color="gainsboro", linewidth=0.8)
             if self.minor_grid_enabled:
-                ax.yaxis.set_minor_locator(MultipleLocator(1.0))
-                ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+                ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+                ax.xaxis.set_minor_locator(mdates.AutoDateLocator(minticks=12, maxticks=36))
+                ax.xaxis.set_minor_formatter(NullFormatter())
                 ax.grid(True, which="minor", color="#ededed", linestyle=":", linewidth=0.6)
             else:
                 ax.yaxis.set_minor_locator(NullLocator())
                 ax.xaxis.set_minor_locator(NullLocator())
+                ax.xaxis.set_minor_formatter(NullFormatter())
                 ax.grid(False, which="minor")
 
     def on_minor_grid_toggle(self):
@@ -3520,6 +3551,33 @@ class ArduinoLoggerApp:
         except Exception as ex:
             self.append_console("ESP command error: {0}".format(ex))
             return False
+
+    def send_terminal_command(self, event=None):
+        raw_command = self.terminal_command_var.get().strip()
+        if not raw_command:
+            return "break"
+
+        command = " ".join(part for part in raw_command.splitlines() if part.strip()).strip()
+        target = str(self.terminal_command_target_var.get() or "ESP").strip().upper()
+        source_kind = "esp" if target == "ESP" else "arduino"
+        ser = self.serial_ports.get(source_kind)
+        if not ser or not ser.is_open:
+            self.append_console("{0} terminal is not connected".format(target))
+            return "break"
+
+        try:
+            ser.write((command + "\n").encode("utf-8"))
+            self.append_console(">>> [{0}] {1}".format(target, command))
+            self.terminal_command_var.set("")
+            active_entry = self.floating_terminal_command_entry if self.terminal_mode == "floating" else self.terminal_command_entry
+            if active_entry is not None:
+                try:
+                    active_entry.focus_set()
+                except Exception:
+                    pass
+        except Exception as ex:
+            self.append_console("{0} command error: {1}".format(target, ex))
+        return "break"
 
     def apply_esp_interval(self, interval_ms, log_to_console=True):
         if not self.source_connected["esp"]:

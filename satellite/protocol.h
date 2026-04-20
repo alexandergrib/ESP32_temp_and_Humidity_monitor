@@ -4,7 +4,7 @@
 
 namespace proto {
 
-static constexpr uint16_t PROTOCOL_VERSION = 6;
+static constexpr uint16_t PROTOCOL_VERSION = 7;
 static constexpr uint8_t  RADIO_CHANNEL     = 6;   // must match on all nodes
 static constexpr uint32_t DEFAULT_REPORT_MS = 1000;
 static constexpr uint32_t MIN_REPORT_MS     = 500;
@@ -80,6 +80,7 @@ struct __attribute__((packed)) BindAck {
     uint8_t accepted;
     uint8_t heaterEnabled;
     uint8_t otaReady;
+    uint8_t sleepEnabled;
     uint16_t sampleRateHz;
 };
 
@@ -107,6 +108,7 @@ struct __attribute__((packed)) ConfigSet {
     float tempOffsetC;
     uint8_t heaterEnabled;
     uint8_t otaReady;
+    uint8_t sleepEnabled;
     uint16_t sampleRateHz;
 };
 
@@ -118,6 +120,7 @@ struct __attribute__((packed)) ConfigAck {
     uint8_t applied;
     uint8_t heaterEnabled;
     uint8_t otaReady;
+    uint8_t sleepEnabled;
     uint16_t sampleRateHz;
 };
 

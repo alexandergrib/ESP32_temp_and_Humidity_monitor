@@ -148,7 +148,8 @@ def wait_for_node_ready(ser: serial.Serial, node_id: int, timeout: float) -> dic
         if event.get("event") == "nodes":
             for item in event.get("items", []):
                 if int(item.get("node_id", 0)) == node_id:
-                    return item
+                    if int(item.get("last_seen_ms", 0) or 0) > 0:
+                        return item
     raise TimeoutError(f"Timed out waiting for node {node_id} to become active")
 
 
@@ -167,13 +168,33 @@ def wait_for_ota_ready_state(ser: serial.Serial, node_id: int, enabled: bool, ti
         if event.get("event") == "config_ack" and int(event.get("node_id", 0)) == node_id:
             if bool(event.get("ota_ready")) == enabled:
                 return event
+    raise TimeoutError(f"Timed out waiting for node {node_id} ota_ready={enabled}")
+
+
+def wait_for_sleep_state(ser: serial.Serial, node_id: int, enabled: bool, timeout: float) -> dict:
+    deadline = time.time() + timeout
+    next_probe_at = 0.0
+    while time.time() < deadline:
+        now = time.time()
+        if now >= next_probe_at:
+            send_command(ser, "NODES")
+            next_probe_at = now + 1.0
+        remaining = max(0.1, deadline - time.time())
+        event = read_event(ser, remaining)
+        if event is None:
+            continue
+        if event.get("event") == "config_ack" and int(event.get("node_id", 0)) == node_id:
+            if bool(event.get("sleep_enabled")) == enabled:
+                return event
         if event.get("event") == "nodes":
             for item in event.get("items", []):
                 if int(item.get("node_id", 0)) != node_id:
                     continue
-                if bool(item.get("ota_ready")) == enabled:
+                if int(item.get("last_seen_ms", 0) or 0) <= 0:
+                    continue
+                if bool(item.get("sleep_enabled")) == enabled:
                     return item
-    raise TimeoutError(f"Timed out waiting for node {node_id} ota_ready={enabled}")
+    raise TimeoutError(f"Timed out waiting for node {node_id} sleep_enabled={enabled}")
 
 
 def wait_for_nodes_snapshot(ser: serial.Serial, timeout: float) -> list[dict]:
@@ -214,25 +235,35 @@ def main() -> int:
     print(f"Size: {total_size} bytes  CRC32: {crc32:08x}")
 
     with serial.Serial(args.port, args.baud, timeout=0.5) as ser:
+        global _pending_events, _pending_text
+        _pending_events = []
+        _pending_text = ""
         ser.dtr = False
         ser.rts = False
         time.sleep(0.5)
         ser.reset_input_buffer()
         send_command(ser, "STREAM ON")
+        send_command(ser, "BIND")
         read_event(ser, 2.0)
+        wait_for_node_ready(ser, args.node_id, 20.0)
         snapshot = wait_for_nodes_snapshot(ser, 8.0)
         saved_intervals: dict[int, int] = {}
+        saved_sleep_enabled: bool | None = None
         target_prepared = False
         for item in snapshot:
             node_id = int(item.get("node_id", 0))
             interval = int(item.get("report_interval_ms", 30000))
             saved_intervals[node_id] = interval
+            if node_id == args.node_id:
+                saved_sleep_enabled = bool(item.get("sleep_enabled"))
             quiet_ms = 30000
             send_command(ser, f"SETINT {node_id} {quiet_ms}")
             read_event(ser, 2.0)
         try:
             send_command(ser, f"SETINT {args.node_id} 30000")
             wait_for_node_ready(ser, args.node_id, 20.0)
+            send_command(ser, f"SLEEP {args.node_id} OFF")
+            wait_for_sleep_state(ser, args.node_id, False, 10.0)
             send_command(ser, f"OTA READY {args.node_id} ON")
             wait_for_ota_ready_state(ser, args.node_id, True, 10.0)
             target_prepared = True
@@ -306,6 +337,12 @@ def main() -> int:
                     wait_for_ota_ready_state(ser, args.node_id, False, 8.0)
                 except Exception:
                     pass
+                if saved_sleep_enabled:
+                    send_command(ser, f"SLEEP {args.node_id} ON")
+                    try:
+                        wait_for_sleep_state(ser, args.node_id, True, 8.0)
+                    except Exception:
+                        pass
 
             for node_id, interval in saved_intervals.items():
                 if interval == 30000:

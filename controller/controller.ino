@@ -46,6 +46,7 @@ struct NodeRecord {
     int8_t lastRssiDbm = 0;
     bool heaterEnabled = false;
     bool otaReady = false;
+    bool sleepEnabled = false;
     uint16_t sampleRateHz = DEFAULT_SAMPLE_RATE_HZ;
     float tempOffsetC = 0.0f;
     uint32_t nextReportDelayMs = 0;
@@ -298,6 +299,7 @@ void saveNode(size_t i) {
     prefs.putUChar((base + "fwmin").c_str(), nodes[i].fwMinor);
     prefs.putFloat((base + "toff").c_str(), nodes[i].tempOffsetC);
     prefs.putBool((base + "heat").c_str(), nodes[i].heaterEnabled);
+    prefs.putBool((base + "sleep").c_str(), nodes[i].sleepEnabled);
     prefs.putUShort((base + "srhz").c_str(), nodes[i].sampleRateHz);
 }
 
@@ -320,6 +322,7 @@ void loadNodes() {
         nodes[i].fwMinor = prefs.getUChar((base + "fwmin").c_str(), 0);
         nodes[i].tempOffsetC = prefs.getFloat((base + "toff").c_str(), 0.0f);
         nodes[i].heaterEnabled = prefs.getBool((base + "heat").c_str(), false);
+        nodes[i].sleepEnabled = prefs.getBool((base + "sleep").c_str(), false);
         nodes[i].sampleRateHz = normalizeSampleRateHz(prefs.getUShort((base + "srhz").c_str(), DEFAULT_SAMPLE_RATE_HZ));
     }
 }
@@ -347,6 +350,7 @@ void sendBindAck(const uint8_t* mac, const NodeRecord& node) {
     ack.tempOffsetC = node.tempOffsetC;
     ack.heaterEnabled = node.heaterEnabled ? 1 : 0;
     ack.otaReady = node.otaReady ? 1 : 0;
+    ack.sleepEnabled = node.sleepEnabled ? 1 : 0;
     ack.sampleRateHz = normalizeSampleRateHz(node.sampleRateHz);
     WiFi.macAddress(ack.controllerMac);
     ack.accepted = 1;
@@ -361,6 +365,7 @@ void sendConfig(
     float tempOffsetC,
     bool heaterEnabled,
     bool otaReady,
+    bool sleepEnabled,
     uint16_t sampleRateHz
 ) {
     int idx = findNodeById(nodeId);
@@ -372,6 +377,7 @@ void sendConfig(
     cfg.tempOffsetC = tempOffsetC;
     cfg.heaterEnabled = heaterEnabled ? 1 : 0;
     cfg.otaReady = otaReady ? 1 : 0;
+    cfg.sleepEnabled = sleepEnabled ? 1 : 0;
     cfg.sampleRateHz = normalizeSampleRateHz(sampleRateHz);
     ensurePeer(nodes[idx].mac);
     esp_now_send(nodes[idx].mac, reinterpret_cast<const uint8_t*>(&cfg), sizeof(cfg));
@@ -386,6 +392,7 @@ void sendNodeConfig(size_t idx) {
         nodes[idx].tempOffsetC,
         nodes[idx].heaterEnabled,
         nodes[idx].otaReady,
+        nodes[idx].sleepEnabled,
         nodes[idx].sampleRateHz
     );
 }
@@ -645,6 +652,7 @@ void handleConfigAck(const uint8_t* mac, const ConfigAck& msg) {
     nodes[idx].tempOffsetC = msg.tempOffsetC;
     nodes[idx].heaterEnabled = msg.heaterEnabled != 0;
     nodes[idx].otaReady = msg.otaReady != 0;
+    nodes[idx].sleepEnabled = msg.sleepEnabled != 0;
     nodes[idx].sampleRateHz = normalizeSampleRateHz(msg.sampleRateHz);
     saveNode(idx);
     printJsonEvent(
@@ -654,6 +662,7 @@ void handleConfigAck(const uint8_t* mac, const ConfigAck& msg) {
         ",\"temp_offset_c\":" + String(nodes[idx].tempOffsetC, 2) +
         ",\"heater_enabled\":" + String(nodes[idx].heaterEnabled ? "true" : "false") +
         ",\"ota_ready\":" + String(nodes[idx].otaReady ? "true" : "false") +
+        ",\"sleep_enabled\":" + String(nodes[idx].sleepEnabled ? "true" : "false") +
         ",\"sample_rate_hz\":" + String(nodes[idx].sampleRateHz) +
         ",\"applied\":" + String(msg.applied ? "true" : "false") + "}"
     );
@@ -832,6 +841,7 @@ void listNodes() {
         Serial.print(",\"temp_offset_c\":"); Serial.print(nodes[i].tempOffsetC, 2);
         Serial.print(",\"heater_enabled\":"); Serial.print(nodes[i].heaterEnabled ? "true" : "false");
         Serial.print(",\"ota_ready\":"); Serial.print(nodes[i].otaReady ? "true" : "false");
+        Serial.print(",\"sleep_enabled\":"); Serial.print(nodes[i].sleepEnabled ? "true" : "false");
         Serial.print(",\"sample_rate_hz\":"); Serial.print(nodes[i].sampleRateHz);
         Serial.print(",\"next_report_delay_ms\":"); Serial.print(nodes[i].nextReportDelayMs);
         Serial.print("}");
@@ -866,7 +876,7 @@ void processSerialCommand(const String& raw) {
     cmd.trim();
     promptShown = false;
     if (cmd.equalsIgnoreCase("HELP")) {
-        Serial.println("Commands: HELP, NODES, BIND, BIND OFF, SETINT <nodeId> <ms>, SETINT ALL <ms>, SETSAMPLE <nodeId> <hz>, SETSAMPLE ALL <hz>, SETTOFF <nodeId> <tempOffsetC>, HEATER <nodeId> ON|OFF, RENAME <nodeId> <name>, STREAM OFF, STREAM ON, TIME STATUS, TIME SET <unixSeconds>, OTA READY <nodeId> ON|OFF, OTA BEGIN <nodeId> <size> <crc32hex>, OTA CHUNK <offset> <hex>, OTA END, OTA STATUS, OTA ABORT");
+        Serial.println("Commands: HELP, NODES, BIND, BIND OFF, SETINT <nodeId> <ms>, SETINT ALL <ms>, SETSAMPLE <nodeId> <hz>, SETSAMPLE ALL <hz>, SLEEP <nodeId> ON|OFF, SLEEP ALL ON|OFF, SETTOFF <nodeId> <tempOffsetC>, HEATER <nodeId> ON|OFF, RENAME <nodeId> <name>, STREAM OFF, STREAM ON, TIME STATUS, TIME SET <unixSeconds>, OTA READY <nodeId> ON|OFF, OTA BEGIN <nodeId> <size> <crc32hex>, OTA CHUNK <offset> <hex>, OTA END, OTA STATUS, OTA ABORT");
     } else if (cmd.equalsIgnoreCase("NODES")) {
         listNodes();
     } else if (cmd.equalsIgnoreCase("BIND")) {
@@ -963,6 +973,58 @@ void processSerialCommand(const String& raw) {
                     nodes[idx].sampleRateHz = hz;
                     saveNode(static_cast<size_t>(idx));
                     sendNodeConfig(static_cast<size_t>(idx));
+                }
+            }
+        }
+    } else if (cmd.startsWith("SLEEP ")) {
+        if (cmd.startsWith("SLEEP ALL ")) {
+            String value = cmd.substring(10);
+            value.trim();
+            bool enabled = false;
+            if (value.equalsIgnoreCase("ON")) {
+                enabled = true;
+            } else if (!value.equalsIgnoreCase("OFF")) {
+                printJsonEvent("{\"event\":\"sleep_error\",\"reason\":\"invalid_value\"}", true);
+                printPrompt();
+                return;
+            }
+            uint32_t appliedCount = 0;
+            for (size_t i = 0; i < MAX_NODES; ++i) {
+                if (!nodes[i].used) continue;
+                nodes[i].sleepEnabled = enabled;
+                saveNode(i);
+                sendNodeConfig(i);
+                appliedCount++;
+            }
+            printJsonEvent(
+                "{\"event\":\"sleep_all\",\"sleep_enabled\":" + String(enabled ? "true" : "false") +
+                ",\"targets\":" + String(appliedCount) + "}",
+                true
+            );
+        } else {
+            int sp = cmd.indexOf(' ', 6);
+            if (sp > 0) {
+                uint32_t nodeId = cmd.substring(6, sp).toInt();
+                String value = cmd.substring(sp + 1);
+                value.trim();
+                int idx = findNodeById(nodeId);
+                if (idx >= 0) {
+                    if (value.equalsIgnoreCase("ON")) {
+                        nodes[idx].sleepEnabled = true;
+                    } else if (value.equalsIgnoreCase("OFF")) {
+                        nodes[idx].sleepEnabled = false;
+                    } else {
+                        printJsonEvent("{\"event\":\"sleep_error\",\"reason\":\"invalid_value\"}", true);
+                        printPrompt();
+                        return;
+                    }
+                    saveNode(static_cast<size_t>(idx));
+                    sendNodeConfig(static_cast<size_t>(idx));
+                    printJsonEvent(
+                        "{\"event\":\"sleep_set\",\"node_id\":" + String(nodeId) +
+                        ",\"sleep_enabled\":" + String(nodes[idx].sleepEnabled ? "true" : "false") + "}",
+                        true
+                    );
                 }
             }
         }
