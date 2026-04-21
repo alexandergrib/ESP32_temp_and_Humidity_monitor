@@ -36,7 +36,7 @@ Flash satellite over USB:
 python -m platformio run -e satellite_upload -t upload
 ```
 
-`platformio.ini` currently uses `COM6` as the default upload port. Change that locally if your board is on a different port.
+If PlatformIO does not auto-detect the correct board, pass a local upload port with `--upload-port`, for example `--upload-port COM6`.
 
 ## Automated Checks
 

@@ -3,9 +3,21 @@ venv/
 .pio/
 __pycache__/
 *.py[cod]
+.pytest_cache/
 
-# JetBrains local workspace state; keep shared project files under .idea tracked.
-.idea/workspace.xml
+# Local IDE/editor state.
+.idea/
+.vscode/
 
 # Local agent handoff/context files.
 .ai/
+
+# Runtime data and generated outputs.
+*.db
+*.db-*
+*.sqlite
+*.csv
+Temp_and_HumidityLogger/config.ini
+Temp_and_HumidityLogger/build/
+Temp_and_HumidityLogger/dist/
+Temp_and_HumidityLogger/log*

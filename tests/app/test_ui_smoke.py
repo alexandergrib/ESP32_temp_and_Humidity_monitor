@@ -6,6 +6,38 @@ from tests.support.path_setup import LOGGER_ROOT  # noqa: F401
 
 
 class UiSmokeTests(unittest.TestCase):
+    def test_app_info_includes_github_url(self):
+        from temp_humidity_logger.settings_ui import SettingsUiMixin
+        from temp_humidity_logger import version
+
+        captured = {}
+
+        class Dummy(SettingsUiMixin):
+            APP_NAME = version.APP_NAME
+            APP_VERSION = version.APP_VERSION
+            GITHUB_URL = version.GITHUB_URL
+            base_dir = "C:\\TempHumidityLogger"
+            root = object()
+
+        def fake_showinfo(title, message, parent=None):
+            captured["title"] = title
+            captured["message"] = message
+            captured["parent"] = parent
+
+        from temp_humidity_logger import settings_ui
+
+        original_showinfo = settings_ui.messagebox.showinfo
+        try:
+            settings_ui.messagebox.showinfo = fake_showinfo
+            Dummy().show_app_info()
+        finally:
+            settings_ui.messagebox.showinfo = original_showinfo
+
+        self.assertEqual(captured["title"], "App Info")
+        self.assertIn(version.APP_NAME, captured["message"])
+        self.assertIn(version.APP_VERSION, captured["message"])
+        self.assertIn(version.GITHUB_URL, captured["message"])
+
     def test_tk_app_starts_and_closes(self):
         try:
             import tkinter as tk

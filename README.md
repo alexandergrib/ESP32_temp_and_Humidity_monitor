@@ -111,7 +111,7 @@ Flash satellite over USB:
 python -m platformio run -e satellite_upload -t upload
 ```
 
-`platformio.ini` currently uses `COM6` as the default upload port. Change that locally if your board is on a different port.
+If PlatformIO does not auto-detect the correct board, pass a local upload port with `--upload-port`, for example `--upload-port COM6`.
 
 ## PC Tools
 
@@ -203,7 +203,7 @@ pip install -r requirements.txt
 python -m temp_humidity_logger.main
 ```
 
-Packaging instructions are documented in [Temp_and_HumidityLogger/README.md](/C:/Users/LENOVO/Downloads/esp32_temp_monitor-20260414T164103Z-3-001/esp32_temp_monitor/Temp_and_HumidityLogger/README.md).
+Packaging instructions are documented in [Temp_and_HumidityLogger/README.md](Temp_and_HumidityLogger/README.md).
 
 ## Testing
 
@@ -219,7 +219,7 @@ Run the full suite, including PlatformIO controller and satellite builds:
 python run_tests.py --suite all
 ```
 
-Detailed test coverage and suite filters are documented in [TESTING.md](/C:/Users/LENOVO/Downloads/esp32_temp_monitor-20260414T164103Z-3-001/esp32_temp_monitor/TESTING.md).
+Detailed test coverage and suite filters are documented in [TESTING.md](TESTING.md).
 
 ## Large Dataset Note
 
