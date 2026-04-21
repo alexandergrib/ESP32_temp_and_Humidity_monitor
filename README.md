@@ -191,7 +191,7 @@ It provides:
 - Satellite-aware smoothing and presence/offline handling
 - App version shown in the window title and App info dialog
 
-The logger entry point remains `arduino_logger_v72.py`, but the implementation is now split into modules under `Temp_and_HumidityLogger/temp_humidity_logger/`.
+The logger entry point is the `temp_humidity_logger.main` module.
 
 Setup:
 
@@ -200,7 +200,7 @@ cd Temp_and_HumidityLogger
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
-python arduino_logger_v72.py
+python -m temp_humidity_logger.main
 ```
 
 Packaging instructions are documented in [Temp_and_HumidityLogger/README.md](/C:/Users/LENOVO/Downloads/esp32_temp_monitor-20260414T164103Z-3-001/esp32_temp_monitor/Temp_and_HumidityLogger/README.md).

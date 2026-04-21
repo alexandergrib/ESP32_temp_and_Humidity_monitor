@@ -129,7 +129,7 @@ if (Test-Path $tkDir)  { $env:TK_LIBRARY  = $tkDir }
     --hidden-import serial.tools.list_ports `
     --hidden-import serial.tools.list_ports_common `
     --hidden-import serial.tools.list_ports_windows `
-    arduino_logger_v72.py
+    temp_humidity_logger\main.py
 
 Write-Host ""
 Write-Host "Build complete:"

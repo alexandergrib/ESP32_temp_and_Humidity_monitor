@@ -17,8 +17,7 @@ def run_unittest(pattern):
 
 
 def compile_logger():
-    files = [ROOT / "Temp_and_HumidityLogger" / "arduino_logger_v72.py"]
-    files.extend((ROOT / "Temp_and_HumidityLogger" / "temp_humidity_logger").glob("*.py"))
+    files = list((ROOT / "Temp_and_HumidityLogger" / "temp_humidity_logger").glob("*.py"))
     result = subprocess.run([sys.executable, "-m", "py_compile", *map(str, files)], cwd=str(ROOT))
     return result.returncode
 

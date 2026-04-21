@@ -30,11 +30,12 @@ pip install -r requirements.txt
 ## Run From Source
 
 ```bash
-python arduino_logger_v72.py
+python -m temp_humidity_logger.main
 ```
 
-`arduino_logger_v72.py` is a compatibility launcher. The app implementation is split into the `temp_humidity_logger` package:
+The app implementation is split into the `temp_humidity_logger` package:
 
+- `main.py` - application entry point
 - `app.py` - main UI orchestration
 - `config_store.py` - config and runtime settings
 - `database.py` - SQLite sessions, markers, and CSV export
@@ -56,7 +57,7 @@ python -m venv venv
 venv\Scripts\activate
 pip install --upgrade pip
 pip install -r requirements.txt
-python arduino_logger_v72.py
+python -m temp_humidity_logger.main
 ```
 
 ## Build Executable
@@ -114,7 +115,7 @@ Common runtime artifacts:
 - `data_humidity.csv`
 
 When running the packaged `.exe`, these files live under `%LOCALAPPDATA%\TempHumidityLogger`.
-When running from source, they live beside `arduino_logger_v72.py`.
+When running from source, they live in `Temp_and_HumidityLogger\`.
 
 Generated build output:
 
@@ -149,8 +150,8 @@ Close serial terminals, previous logger instances, or OTA tools using the same p
 
 ## Relevant Files
 
-- `arduino_logger_v72.py` - compatibility launcher
 - `temp_humidity_logger\` - modular application package
+- `temp_humidity_logger\main.py` - source and PyInstaller entry point
 - `build_exe.ps1` - primary Windows packaging script
 - `TempHumidityLogger.spec` - PyInstaller spec
 - `config.ini` - local runtime configuration
