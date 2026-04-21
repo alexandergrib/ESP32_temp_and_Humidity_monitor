@@ -19,6 +19,8 @@ class FirmwareStaticContractTests(unittest.TestCase):
         for event_name in (
             "controller_ready",
             "node_bound",
+            "node_online",
+            "node_offline",
             "reading",
             "config_ack",
             "rename_ack",
@@ -30,6 +32,15 @@ class FirmwareStaticContractTests(unittest.TestCase):
         source = self.read("controller/controller.ino")
         for command in ("STREAM", "SETINT", "NODES", "TIME", "RENAME", "SLEEP"):
             self.assertIn(command, source)
+
+    def test_controller_owns_satellite_presence_decisions(self):
+        source = self.read("controller/controller.ino")
+
+        self.assertIn("bool online = false", source)
+        self.assertIn("nodePresenceTimeoutMs", source)
+        self.assertIn("checkNodePresence();", source)
+        self.assertIn("\"node_offline\"", source)
+        self.assertIn("\"node_online\"", source)
 
     def test_ota_suppresses_normal_readings(self):
         controller = self.read("controller/controller.ino")
@@ -62,6 +73,17 @@ class FirmwareStaticContractTests(unittest.TestCase):
         self.assertIn("if (!sensorOk)", satellite)
         self.assertIn("Sensor read failed: sending heartbeat without measurement", satellite)
         self.assertIn("enqueueBufferedReading(temperatureC, humidityPct, sensorOk)", satellite)
+
+    def test_satellite_stays_awake_until_reading_ack(self):
+        satellite = self.read("satellite/satellite.ino")
+
+        self.assertIn("READING_ACK_RECOVERY_RETRY_MS = 1000", satellite)
+        self.assertIn("READING_ACK_STAY_AWAKE_MS = 2000", satellite)
+        self.assertIn("stayAwakeForController(READING_ACK_STAY_AWAKE_MS);", satellite)
+        self.assertRegex(
+            satellite,
+            re.compile(r"if \(BufferedReading\* pending = oldestBufferedReading\(\)\).*?return;", re.DOTALL),
+        )
 
     def test_sleep_mode_requires_long_report_interval(self):
         shared_protocol = self.read("shared/protocol.h")

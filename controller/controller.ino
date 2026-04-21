@@ -42,6 +42,7 @@ struct NodeRecord {
     uint8_t mac[6] = {0};
     char name[16] = {0};
     uint32_t lastSeenMs = 0;
+    bool online = false;
     uint32_t reportIntervalMs = DEFAULT_REPORT_MS;
     float lastTempC = NAN;
     float lastHumidity = NAN;
@@ -114,6 +115,9 @@ bool effectiveOtaReady(const NodeRecord& node);
 bool effectiveOtaPause(const NodeRecord& node);
 bool effectiveSleepEnabled(const NodeRecord& node);
 void setNodeOtaPrep(size_t idx, bool enabled, bool pushConfig = true);
+void printJsonEvent(const String& json, bool force = false);
+void markNodeSeen(size_t idx, uint32_t nowMs);
+void checkNodePresence();
 
 bool timeReached(uint32_t now, uint32_t target) {
     return static_cast<int32_t>(now - target) >= 0;
@@ -330,6 +334,51 @@ void saveNode(size_t i) {
     prefs.putUShort((base + "srhz").c_str(), nodes[i].sampleRateHz);
 }
 
+uint32_t nodePresenceTimeoutMs(const NodeRecord& node) {
+    const uint32_t intervalMs = effectiveReportIntervalMs(node);
+    const uint32_t captureMs = satelliteCaptureWindowMs(intervalMs);
+    const uint32_t expectedGapMs = intervalMs + captureMs;
+    const uint32_t slackMs = max(captureMs, intervalMs / 2U);
+    return (expectedGapMs * 3U) + slackMs;
+}
+
+void printNodePresenceEvent(const NodeRecord& node, bool online, uint32_t nowMs) {
+    const uint32_t ageMs = node.lastSeenMs == 0 ? 0 : (nowMs - node.lastSeenMs);
+    printJsonEvent(
+        "{\"event\":\"" + String(online ? "node_online" : "node_offline") +
+        "\",\"node_id\":" + String(node.nodeId) +
+        ",\"name\":\"" + String(node.name) +
+        "\",\"mac\":\"" + macToString(node.mac) +
+        "\",\"last_seen_ms\":" + String(node.lastSeenMs) +
+        ",\"age_ms\":" + String(ageMs) +
+        ",\"report_interval_ms\":" + String(effectiveReportIntervalMs(node)) +
+        ",\"presence_timeout_ms\":" + String(nodePresenceTimeoutMs(node)) + "}",
+        true
+    );
+}
+
+void markNodeSeen(size_t idx, uint32_t nowMs) {
+    if (idx >= MAX_NODES || !nodes[idx].used) return;
+    const bool wasOnline = nodes[idx].online;
+    markNodeSeen(static_cast<size_t>(idx), nowMs);
+    nodes[idx].online = true;
+    if (!wasOnline) {
+        printNodePresenceEvent(nodes[idx], true, nowMs);
+    }
+}
+
+void checkNodePresence() {
+    const uint32_t nowMs = millis();
+    for (size_t i = 0; i < MAX_NODES; ++i) {
+        NodeRecord& node = nodes[i];
+        if (!node.used || !node.online || node.lastSeenMs == 0) continue;
+        if (timeReached(nowMs, node.lastSeenMs + nodePresenceTimeoutMs(node))) {
+            node.online = false;
+            printNodePresenceEvent(node, false, nowMs);
+        }
+    }
+}
+
 void loadNodes() {
     prefs.begin("tmon-ctrl", false);
     nextNodeId = prefs.getUInt("nextNodeId", 1);
@@ -351,10 +400,11 @@ void loadNodes() {
         nodes[i].heaterEnabled = prefs.getBool((base + "heat").c_str(), false);
         nodes[i].sleepEnabled = prefs.getBool((base + "sleep").c_str(), DEFAULT_SLEEP_ENABLED);
         nodes[i].sampleRateHz = normalizeSampleRateHz(prefs.getUShort((base + "srhz").c_str(), DEFAULT_SAMPLE_RATE_HZ));
+        nodes[i].online = false;
     }
 }
 
-void printJsonEvent(const String& json, bool force = false) {
+void printJsonEvent(const String& json, bool force) {
     if (!force && !streamEnabled) return;
     Serial.println(withControllerTime(json));
 }
@@ -723,7 +773,7 @@ void handleBindRequest(const uint8_t* mac, const BindRequest& req) {
         nodes[idx].sampleRateHz = DEFAULT_SAMPLE_RATE_HZ;
         nodes[idx].sleepEnabled = DEFAULT_SLEEP_ENABLED;
     }
-    nodes[idx].lastSeenMs = nowMs;
+    markNodeSeen(static_cast<size_t>(idx), nowMs);
     saveNode(idx);
     if (shouldRebuildSchedule) {
         rebuildReportSchedule();
@@ -743,7 +793,7 @@ void handleBindRequest(const uint8_t* mac, const BindRequest& req) {
 void handleReading(const uint8_t* mac, const Reading& msg, int8_t rssiDbm) {
     int idx = findNodeByMac(mac);
     if (idx < 0) return;
-    nodes[idx].lastSeenMs = millis();
+    markNodeSeen(static_cast<size_t>(idx), millis());
     const bool suppressNormalReading =
         effectiveOtaReady(nodes[idx]) ||
         effectiveOtaPause(nodes[idx]) ||
@@ -783,7 +833,7 @@ void handleReading(const uint8_t* mac, const Reading& msg, int8_t rssiDbm) {
 void handleConfigAck(const uint8_t* mac, const ConfigAck& msg) {
     int idx = findNodeByMac(mac);
     if (idx < 0) return;
-    nodes[idx].lastSeenMs = millis();
+    markNodeSeen(static_cast<size_t>(idx), millis());
     const uint32_t reportedIntervalMs = normalizeReportInterval(msg.reportIntervalMs);
     const bool reportedOtaReady = msg.otaReady != 0;
     const bool reportedSleepEnabled = msg.sleepEnabled != 0;
@@ -818,7 +868,7 @@ void handleRenameAck(const uint8_t* mac, const RenameAck& ack) {
     const String sanitizedName = sanitizeNodeName(String(ack.nodeName));
     if (ack.applied) {
         sanitizedName.toCharArray(nodes[idx].name, sizeof(nodes[idx].name));
-        nodes[idx].lastSeenMs = millis();
+        markNodeSeen(static_cast<size_t>(idx), millis());
         saveNode(static_cast<size_t>(idx));
     }
 
@@ -984,6 +1034,7 @@ void listNodes() {
         Serial.print(",\"name\":\""); Serial.print(nodes[i].name);
         Serial.print("\",\"mac\":\""); Serial.print(macToString(nodes[i].mac));
         Serial.print("\",\"last_seen_ms\":"); Serial.print(nodes[i].lastSeenMs);
+        Serial.print(",\"online\":"); Serial.print(nodes[i].online ? "true" : "false");
         Serial.print(",\"report_interval_ms\":"); Serial.print(effectiveReportMs);
         Serial.print(",\"fw_version\":\""); Serial.print(nodes[i].fwMajor); Serial.print("."); Serial.print(nodes[i].fwMinor); Serial.print("\"");
         Serial.print(",\"rssi_dbm\":"); Serial.print(nodes[i].lastRssiDbm);
@@ -1430,4 +1481,6 @@ void loop() {
             retryPendingOtaFrame();
         }
     }
+
+    checkNodePresence();
 }

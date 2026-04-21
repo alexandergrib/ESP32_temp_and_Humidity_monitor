@@ -50,7 +50,8 @@ static constexpr uint32_t SENSOR_AVERAGING_WINDOW_MIN_MS = 1000;
 static constexpr uint32_t SENSOR_WAKE_MARGIN_MS = 500;
 static constexpr uint32_t READING_ACK_TIMEOUT_MS = 250;
 static constexpr uint32_t READING_RETRY_BACKOFF_MS = 150;
-static constexpr uint8_t READING_MAX_RETRIES = 3;
+static constexpr uint32_t READING_ACK_RECOVERY_RETRY_MS = 1000;
+static constexpr uint32_t READING_ACK_STAY_AWAKE_MS = 2000;
 static constexpr uint32_t CONTROLLER_AWAKE_WINDOW_MS = 5000;
 static constexpr uint32_t SETTINGS_SYNC_WAKE_THRESHOLD_MS = 2000;
 static constexpr uint32_t SETTINGS_SYNC_RETRY_MS = 1500;
@@ -1087,17 +1088,15 @@ void serviceReadingDelivery() {
     }
 
     const uint32_t nowMs = millis();
+    stayAwakeForController(READING_ACK_STAY_AWAKE_MS);
     if (pending->lastSendAtMs == 0) {
         sendReading();
         return;
     }
 
     uint32_t nextRetryAtMs = pending->lastSendAtMs + READING_ACK_TIMEOUT_MS;
-    if (pending->retryCount >= READING_MAX_RETRIES) {
-        nextRetryAtMs = pending->lastSendAtMs + max<uint32_t>(normalizeReportInterval(reportIntervalMs), READING_ACK_TIMEOUT_MS);
-        if (timeReachedMs(nowMs, nextRetryAtMs)) {
-            pending->retryCount = 0;
-        }
+    if (pending->retryCount >= 3) {
+        nextRetryAtMs = pending->lastSendAtMs + READING_ACK_RECOVERY_RETRY_MS;
     } else {
         nextRetryAtMs += READING_RETRY_BACKOFF_MS;
     }
@@ -1146,16 +1145,8 @@ void maybeSleep() {
 
     uint32_t nextWakeAtMs = nextReportDueAtMs;
     if (BufferedReading* pending = oldestBufferedReading()) {
-        const uint32_t staleAfterMs = max<uint32_t>(15000, normalizeReportInterval(reportIntervalMs) * 3U);
-        if (!timeReachedMs(nowMs, lastControllerContactAtMs + staleAfterMs)) {
-            return;
-        }
-        const uint32_t fallbackWakeAtMs = pending->lastSendAtMs == 0
-            ? (nowMs + MIN_REPORT_MS)
-            : (pending->lastSendAtMs + normalizeReportInterval(reportIntervalMs));
-        if (timeReachedMs(nextWakeAtMs, fallbackWakeAtMs)) {
-            nextWakeAtMs = fallbackWakeAtMs;
-        }
+        stayAwakeForController(READING_ACK_STAY_AWAKE_MS);
+        return;
     }
 
     if (timeReachedMs(nowMs + 20, nextWakeAtMs)) {

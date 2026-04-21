@@ -136,7 +136,8 @@ class EspControllerTests(unittest.TestCase):
     def test_presence_timeout_scales_with_interval(self):
         harness = EspHarness()
         self.assertGreater(harness.esp_presence_timeout_seconds(20000), harness.esp_presence_timeout_seconds(1000))
-        self.assertGreater(harness.esp_presence_timeout_seconds(60000), 180)
+        self.assertGreater(harness.esp_presence_timeout_seconds(60000), 200)
+        self.assertAlmostEqual(harness.esp_expected_reading_gap_seconds(60000), 72.5)
 
     def test_interval_reduction_adds_grace(self):
         harness = EspHarness()
@@ -234,6 +235,35 @@ class EspControllerTests(unittest.TestCase):
         state = harness.esp_node_state[2]
         self.assertTrue(state["online"])
         self.assertEqual(harness.markers, [])
+
+    def test_controller_offline_event_marks_satellite_offline(self):
+        harness = EspHarness()
+        harness.process_esp_packet_line(
+            '{"event":"node_online","node_id":2,"name":"satellite","controller_time":"2026-04-21T08:15:43Z"}'
+        )
+        harness.process_esp_packet_line(
+            '{"event":"node_offline","node_id":2,"name":"satellite","controller_time":"2026-04-21T08:20:43Z"}'
+        )
+        slot = harness.esp_slot_by_node_id[2]
+
+        self.assertFalse(harness.esp_node_state[2]["online"])
+        self.assertEqual(harness.current_signals[slot], "offline")
+        self.assertTrue(any("lost connection" in item[0] for item in harness.markers))
+
+    def test_app_presence_timer_does_not_mark_satellite_offline(self):
+        harness = EspHarness()
+        harness.process_esp_packet_line(
+            '{"event":"reading","node_id":2,"name":"satellite","temperature_c":22.5,'
+            '"humidity_pct":40.5,"sensor_ok":true,"signal_pct":95,"rssi_dbm":-52,'
+            '"report_interval_ms":60000,"next_report_delay_ms":59000,'
+            '"controller_time":"2026-04-21T08:15:43Z"}'
+        )
+
+        with patch("temp_humidity_logger.esp_controller.time.monotonic", return_value=100000.0):
+            harness.check_esp_presence()
+
+        self.assertTrue(harness.esp_node_state[2]["online"])
+        self.assertFalse(any("lost connection" in item[0] for item in harness.markers))
 
     def test_nan_sensor_reading_keeps_node_online_but_does_not_save_data(self):
         harness = EspHarness()

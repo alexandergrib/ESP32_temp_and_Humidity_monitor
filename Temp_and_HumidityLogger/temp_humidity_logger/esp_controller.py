@@ -37,10 +37,7 @@ class EspControllerMixin:
             interval_ms = max(250, int(report_interval_ms))
         except Exception:
             interval_ms = self.default_esp_report_interval_ms()
-        capture_window_ms = min(
-            interval_ms,
-            max(1, min((interval_ms * 20) // 100, 1000))
-        )
+        capture_window_ms = 500 + max(1000, (interval_ms * 20) // 100)
         expected_reading_gap_ms = interval_ms + capture_window_ms
         slack_ms = max(capture_window_ms, interval_ms // 2)
         return ((expected_reading_gap_ms * 3) + slack_ms) / 1000.0
@@ -51,10 +48,7 @@ class EspControllerMixin:
             interval_ms = max(250, int(report_interval_ms))
         except Exception:
             interval_ms = self.default_esp_report_interval_ms()
-        capture_window_ms = min(
-            interval_ms,
-            max(1, min((interval_ms * 20) // 100, 1000))
-        )
+        capture_window_ms = 500 + max(1000, (interval_ms * 20) // 100)
         return (interval_ms + capture_window_ms) / 1000.0
 
 
@@ -167,37 +161,6 @@ class EspControllerMixin:
 
     def check_esp_presence(self):
         self.esp_presence_job = None
-        now_monotonic = time.monotonic()
-        now_dt = datetime.now()
-        if self.source_connected["esp"]:
-            for node_id, state in list(self.esp_node_state.items()):
-                if not state.get("online"):
-                    continue
-                report_interval_ms = state.get("report_interval_ms") or self.default_esp_report_interval_ms()
-                try:
-                    report_interval_ms = max(250, int(report_interval_ms))
-                except Exception:
-                    report_interval_ms = self.default_esp_report_interval_ms()
-                stale_after_s = self.esp_presence_timeout_seconds(report_interval_ms)
-                last_seen = float(state.get("last_seen_monotonic") or 0.0)
-                next_report_delay_ms = 0
-                try:
-                    next_report_delay_ms = max(0, int(state.get("next_report_delay_ms") or 0))
-                except Exception:
-                    next_report_delay_ms = 0
-                schedule_seen = float(state.get("schedule_seen_monotonic") or 0.0)
-                if next_report_delay_ms > 0 and schedule_seen > 0.0:
-                    scheduled_timeout_s = (
-                        (schedule_seen - last_seen)
-                        + (next_report_delay_ms / 1000.0)
-                        + self.esp_presence_timeout_seconds(max(report_interval_ms, next_report_delay_ms))
-                    )
-                    stale_after_s = max(stale_after_s, scheduled_timeout_s)
-                grace_until = float(state.get("presence_grace_until_monotonic") or 0.0)
-                if grace_until > now_monotonic:
-                    continue
-                if last_seen > 0.0 and (now_monotonic - last_seen) > stale_after_s:
-                    self.update_esp_node_presence(node_id, False, dt=now_dt)
         self.schedule_esp_presence_check()
 
 
@@ -331,6 +294,30 @@ class EspControllerMixin:
         if event_name == "controller_ready":
             if not self.esp_stream_confirmed:
                 self.schedule_esp_init(200)
+            return
+        if event_name in ("node_online", "node_offline"):
+            try:
+                node_id = int(event.get("node_id"))
+            except Exception:
+                return
+            slot_idx = self.allocate_esp_slot(node_id)
+            if slot_idx is None:
+                return
+            node_name = str(event.get("name", "") or "satellite")
+            self.update_esp_slot_metadata(slot_idx, node_id, node_name)
+            state = self.ensure_esp_node_state(node_id)
+            state["slot_idx"] = slot_idx
+            state["name"] = node_name
+            now = self.parse_esp_timestamp(event)
+            now_monotonic = time.monotonic()
+            if event_name == "node_online":
+                state["last_seen_monotonic"] = now_monotonic
+                state["last_seen_dt"] = now
+                if self.current_signals[slot_idx] in ("offline", "", None):
+                    self.current_signals[slot_idx] = "waiting"
+                self.update_esp_node_presence(node_id, True, dt=now)
+            else:
+                self.update_esp_node_presence(node_id, False, dt=now)
             return
         if event_name == "node_bound":
             try:
@@ -480,8 +467,6 @@ class EspControllerMixin:
                 state["name"] = node_name
                 state["signal_pct"] = signal_pct
                 state["rssi_dbm"] = rssi_dbm
-                if not state.get("online") and not float(state.get("last_seen_monotonic") or 0.0):
-                    self.current_signals[slot_idx] = "waiting"
                 self.update_esp_node_schedule_from_event(state, item)
                 if not state.get("report_interval_ms"):
                     state["report_interval_ms"] = self.default_esp_report_interval_ms()
@@ -489,9 +474,19 @@ class EspControllerMixin:
                     state["sleep_enabled"] = bool(item.get("sleep_enabled"))
                 except Exception:
                     state["sleep_enabled"] = state.get("sleep_enabled", False)
-                # NODES is controller metadata and can include satellites that have
-                # not talked since before this app session. Start offline monitoring
-                # only after a live reading/config ack from the satellite.
+                if item.get("online") is not None:
+                    now = self.parse_esp_timestamp(event)
+                    is_online = bool(item.get("online"))
+                    if is_online:
+                        state["last_seen_monotonic"] = time.monotonic()
+                        state["last_seen_dt"] = now
+                    self.update_esp_node_presence(node_id, is_online, dt=now)
+                    if not is_online:
+                        self.current_signals[slot_idx] = "offline"
+                    elif self.current_signals[slot_idx] in ("offline", "", None):
+                        self.current_signals[slot_idx] = "waiting"
+                elif not state.get("online") and not float(state.get("last_seen_monotonic") or 0.0):
+                    self.current_signals[slot_idx] = "waiting"
                 self.update_channel_tree_row(slot_idx, signal_display=self.current_signals[slot_idx])
                 updated_any = True
             if updated_any:
