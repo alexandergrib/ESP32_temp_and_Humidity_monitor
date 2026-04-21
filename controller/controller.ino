@@ -22,7 +22,8 @@ static constexpr uint32_t STATUS_LED_PERIOD_MS = 1000;
 static constexpr uint32_t STATUS_LED_ON_MS = 80;
 static constexpr uint32_t MIN_REPORT_SLOT_GAP_MS = 250;
 static constexpr uint8_t SATELLITE_AVERAGING_WINDOW_PERCENT = 20;
-static constexpr uint32_t SATELLITE_AVERAGING_WINDOW_MAX_MS = 1000;
+static constexpr uint32_t SATELLITE_AVERAGING_WINDOW_MIN_MS = 1000;
+static constexpr uint32_t SATELLITE_WAKE_MARGIN_MS = 500;
 static constexpr uint32_t OFFLINE_REPROBE_MS = 2000;
 static constexpr uint32_t OTA_ACK_TIMEOUT_MS = 1500;
 static constexpr uint8_t OTA_MAX_RETRIES = 3;
@@ -130,10 +131,14 @@ uint16_t normalizeSampleRateHz(uint32_t hz) {
     return static_cast<uint16_t>(constrain(hz, MIN_SAMPLE_RATE_HZ, MAX_SAMPLE_RATE_HZ));
 }
 
-uint32_t satelliteCaptureWindowMs(uint32_t reportIntervalMs) {
+uint32_t satelliteAveragingWindowMs(uint32_t reportIntervalMs) {
     const uint32_t normalizedReportMs = normalizeReportInterval(reportIntervalMs);
     const uint32_t scaledWindowMs = (normalizedReportMs * SATELLITE_AVERAGING_WINDOW_PERCENT) / 100U;
-    return min<uint32_t>(normalizedReportMs, max<uint32_t>(1, min<uint32_t>(scaledWindowMs, SATELLITE_AVERAGING_WINDOW_MAX_MS)));
+    return max<uint32_t>(SATELLITE_AVERAGING_WINDOW_MIN_MS, scaledWindowMs);
+}
+
+uint32_t satelliteCaptureWindowMs(uint32_t reportIntervalMs) {
+    return SATELLITE_WAKE_MARGIN_MS + satelliteAveragingWindowMs(reportIntervalMs);
 }
 
 String sanitizeNodeName(String name) {

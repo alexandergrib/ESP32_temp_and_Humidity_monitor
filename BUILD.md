@@ -35,7 +35,16 @@ Flash satellite over USB:
 ```bash
 python -m platformio run -e satellite_upload -t upload
 ```
+```text
+Flash over OTA
+```
 
+```bash
+python pc_logger\ota_satellite.py --port COM6 --node-id 1 --firmware .pio\build\satellite_upload\firmware.bin
+```
+```bash
+python pc_logger\ota_satellite.py --port COM6 --node-id 2 --firmware .pio\build\satellite_upload\firmware.bin
+```
 If PlatformIO does not auto-detect the correct board, pass a local upload port with `--upload-port`, for example `--upload-port COM6`.
 
 ## Desktop App Build

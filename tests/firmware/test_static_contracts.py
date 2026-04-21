@@ -49,6 +49,20 @@ class FirmwareStaticContractTests(unittest.TestCase):
         for token in ("reportIntervalMs", "sleepEnabled", "nodeId", "temperatureC", "humidityPct"):
             self.assertIn(token, source)
 
+    def test_satellite_sensor_capture_has_wake_margin_and_valid_reading_gate(self):
+        controller = self.read("controller/controller.ino")
+        satellite = self.read("satellite/satellite.ino")
+
+        self.assertIn("SATELLITE_AVERAGING_WINDOW_MIN_MS = 1000", controller)
+        self.assertIn("SATELLITE_WAKE_MARGIN_MS = 500", controller)
+        self.assertIn("SENSOR_AVERAGING_WINDOW_MIN_MS = 1000", satellite)
+        self.assertIn("SENSOR_WAKE_MARGIN_MS = 500", satellite)
+        self.assertIn("max<uint32_t>(SENSOR_AVERAGING_WINDOW_MIN_MS, scaledWindowMs)", satellite)
+        self.assertIn("SENSOR_WAKE_MARGIN_MS + sensorAveragingWindowMs()", satellite)
+        self.assertIn("if (!sensorOk)", satellite)
+        self.assertIn("Sensor read failed: sending heartbeat without measurement", satellite)
+        self.assertIn("enqueueBufferedReading(temperatureC, humidityPct, sensorOk)", satellite)
+
     def test_sleep_mode_requires_long_report_interval(self):
         shared_protocol = self.read("shared/protocol.h")
         controller = self.read("controller/controller.ino")

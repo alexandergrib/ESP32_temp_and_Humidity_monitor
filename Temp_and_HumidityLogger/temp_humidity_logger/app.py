@@ -710,7 +710,7 @@ class ArduinoLoggerApp(
         )
         self.sleep_all_var = tk.BooleanVar(value=False)
         settings_menu.add_checkbutton(
-            label="Satellite sleep mode",
+            label="Satellite sleep mode ALL on/off",
             variable=self.sleep_all_var,
             command=self.on_sleep_all_toggle
         )
@@ -724,6 +724,7 @@ class ArduinoLoggerApp(
             command=lambda: self.open_calibration_manager("hum")
         )
         settings_menu.add_separator()
+        settings_menu.add_command(label="Open logs folder...", command=self.open_logs_folder)
         settings_menu.add_command(label="App info...", command=self.show_app_info)
 
         self.notebook = ttk.Notebook(self.root)

@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests.support.path_setup import LOGGER_ROOT  # noqa: F401
 
@@ -55,6 +56,27 @@ class UiSmokeTests(unittest.TestCase):
         self.assertIn(version.APP_NAME, captured["message"])
         self.assertIn(version.APP_VERSION, captured["message"])
         self.assertIn(version.GITHUB_URL, captured["message"])
+
+    def test_open_logs_folder_uses_runtime_data_dir(self):
+        from temp_humidity_logger.settings_ui import SettingsUiMixin
+
+        class Dummy(SettingsUiMixin):
+            base_dir = "C:\\TempHumidityLogger"
+            root = object()
+
+        with mock.patch("temp_humidity_logger.settings_ui.os.makedirs") as makedirs:
+            with mock.patch("temp_humidity_logger.settings_ui.sys.platform", "win32"):
+                with mock.patch("temp_humidity_logger.settings_ui.os.startfile", create=True) as startfile:
+                    Dummy().open_logs_folder()
+
+        makedirs.assert_called_once_with(Dummy.base_dir, exist_ok=True)
+        startfile.assert_called_once_with(Dummy.base_dir)
+
+    def test_menu_labels_include_logs_and_sleep_all(self):
+        source = (LOGGER_ROOT / "temp_humidity_logger" / "app.py").read_text(encoding="utf-8")
+
+        self.assertIn('label="Open logs folder..."', source)
+        self.assertIn('label="Satellite sleep mode ALL on/off"', source)
 
     def test_windows_build_uses_app_icon(self):
         build_script = (LOGGER_ROOT / "build_exe.ps1").read_text(encoding="utf-8")

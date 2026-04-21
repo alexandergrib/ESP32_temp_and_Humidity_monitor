@@ -46,7 +46,8 @@ static constexpr float SENSOR_MAX_VALID_TEMP_C = 125.0f;
 static constexpr float SENSOR_MIN_VALID_HUMIDITY_PCT = 0.0f;
 static constexpr float SENSOR_MAX_VALID_HUMIDITY_PCT = 100.0f;
 static constexpr uint8_t SENSOR_AVERAGING_WINDOW_PERCENT = 20;
-static constexpr uint32_t SENSOR_AVERAGING_WINDOW_MAX_MS = 1000;
+static constexpr uint32_t SENSOR_AVERAGING_WINDOW_MIN_MS = 1000;
+static constexpr uint32_t SENSOR_WAKE_MARGIN_MS = 500;
 static constexpr uint32_t READING_ACK_TIMEOUT_MS = 250;
 static constexpr uint32_t READING_RETRY_BACKOFF_MS = 150;
 static constexpr uint8_t READING_MAX_RETRIES = 3;
@@ -156,7 +157,7 @@ void applyControllerState(
 );
 void beginCaptureWindow();
 void completeCaptureWindow();
-void captureScheduledReading();
+bool captureScheduledReading();
 void saveConfig();
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
 void onDataRecv(const esp_now_recv_info_t*, const uint8_t* data, int len);
@@ -292,17 +293,18 @@ bool canReuseLastSampleForChunk(uint32_t nowUs) {
            (nowUs - lastGoodSampleAtUs) <= max(SENSOR_EMPTY_CHUNK_FILL_MAX_AGE_US, samplePeriodUs() * 2U);
 }
 
-uint32_t captureWindowMs() {
+uint32_t sensorAveragingWindowMs() {
     const uint32_t normalizedReportMs = normalizeReportInterval(reportIntervalMs);
     const uint32_t scaledWindowMs = (normalizedReportMs * SENSOR_AVERAGING_WINDOW_PERCENT) / 100U;
-    return min<uint32_t>(
-        normalizedReportMs,
-        max<uint32_t>(1, min<uint32_t>(scaledWindowMs, SENSOR_AVERAGING_WINDOW_MAX_MS))
-    );
+    return max<uint32_t>(SENSOR_AVERAGING_WINDOW_MIN_MS, scaledWindowMs);
+}
+
+uint32_t captureWindowMs() {
+    return SENSOR_WAKE_MARGIN_MS + sensorAveragingWindowMs();
 }
 
 uint32_t averagingWindowMs() {
-    return captureWindowMs();
+    return sensorAveragingWindowMs();
 }
 
 uint32_t averagingWindowUs() {
@@ -577,14 +579,19 @@ void completeCaptureWindow() {
     stayAwakeForController(READING_ACK_TIMEOUT_MS + READING_RETRY_BACKOFF_MS + 500);
 }
 
-void captureScheduledReading() {
+bool captureScheduledReading() {
     float temperatureC = NAN;
     float humidityPct = NAN;
     bool sensorOk = false;
     prepareReadingSnapshot(temperatureC, humidityPct, sensorOk);
+    if (!sensorOk) {
+        Serial.println("Sensor read failed: sending heartbeat without measurement");
+    }
     if (!enqueueBufferedReading(temperatureC, humidityPct, sensorOk)) {
         Serial.println("Reading buffer full, keeping oldest unsent data");
+        return false;
     }
+    return true;
 }
 
 void markSampleRequestScheduled(uint32_t nowUs) {

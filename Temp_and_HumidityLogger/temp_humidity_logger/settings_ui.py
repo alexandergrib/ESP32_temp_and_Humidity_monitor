@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 
 import serial.tools.list_ports
 import tkinter as tk
@@ -18,6 +20,22 @@ class SettingsUiMixin:
             ),
             parent=self.root,
         )
+
+    def open_logs_folder(self):
+        try:
+            os.makedirs(self.base_dir, exist_ok=True)
+            if sys.platform.startswith("win"):
+                os.startfile(self.base_dir)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", self.base_dir])
+            else:
+                subprocess.Popen(["xdg-open", self.base_dir])
+        except Exception as ex:
+            messagebox.showwarning(
+                "Open Logs Folder",
+                "Could not open logs folder:\n{0}\n\n{1}".format(self.base_dir, ex),
+                parent=self.root,
+            )
 
     def open_com_settings(self):
         dialog = tk.Toplevel(self.root)

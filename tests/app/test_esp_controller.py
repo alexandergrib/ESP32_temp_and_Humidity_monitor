@@ -35,6 +35,7 @@ class EspHarness(EspControllerMixin):
         self.esp_init_job = None
         self.markers = []
         self.saved = []
+        self.row_updates = []
         self.redraws = 0
         self.console = []
         self.interval_ms = 30000
@@ -43,7 +44,7 @@ class EspHarness(EspControllerMixin):
         return self.interval_ms
 
     def update_channel_tree_row(self, *args, **kwargs):
-        pass
+        self.row_updates.append((args, kwargs))
 
     def refresh_legend(self):
         pass
@@ -244,6 +245,7 @@ class EspControllerTests(unittest.TestCase):
         slot = harness.esp_slot_by_node_id[2]
         self.assertTrue(harness.esp_node_state[2]["online"])
         self.assertEqual(harness.current_temps[slot], "NaN")
+        self.assertIn(((slot, "sensor error", "sensor error", "95%"), {}), harness.row_updates)
         self.assertFalse(any(item[0] == "db" for item in harness.saved))
 
     def test_valid_reading_saves_and_schedules_redraw(self):

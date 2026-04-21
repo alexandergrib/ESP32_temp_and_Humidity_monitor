@@ -393,7 +393,7 @@ class EspControllerMixin:
             if not sensor_ok or not math.isfinite(temp_raw) or not math.isfinite(hum_raw):
                 self.current_temps[slot_idx] = "NaN"
                 self.current_hums[slot_idx] = "NaN"
-                self.update_channel_tree_row(slot_idx, "-", "-", self.current_signals[slot_idx])
+                self.update_channel_tree_row(slot_idx, "sensor error", "sensor error", self.current_signals[slot_idx])
                 self.refresh_legend()
                 return
             temp_cal = self.apply_calibration("temp", slot_idx, temp_raw)
