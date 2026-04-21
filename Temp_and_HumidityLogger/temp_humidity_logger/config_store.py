@@ -218,7 +218,7 @@ class ConfigMixin:
             )
 
         if cfg.has_section("columns"):
-            for col_id in ("rec", "id", "name", "temp", "hum", "signal"):
+            for col_id in ("rec", "sleep", "id", "name", "temp", "hum", "signal"):
                 width_text = cfg.get("columns", col_id, fallback="").strip()
                 if not width_text:
                     continue
@@ -293,6 +293,7 @@ class ConfigMixin:
         if hasattr(self, "tree"):
             cfg["columns"] = {
                 "rec": str(int(self.tree.column("rec", "width"))),
+                "sleep": str(int(self.tree.column("sleep", "width"))),
                 "id": str(int(self.tree.column("id", "width"))),
                 "name": str(int(self.tree.column("name", "width"))),
                 "temp": str(int(self.tree.column("temp", "width"))),

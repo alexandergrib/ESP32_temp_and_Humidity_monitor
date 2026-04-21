@@ -9,6 +9,7 @@ static constexpr uint16_t PROTOCOL_VERSION = FIRMWARE_PROTOCOL_VERSION;
 static constexpr uint8_t  RADIO_CHANNEL     = 6;   // must match on all nodes
 static constexpr uint32_t DEFAULT_REPORT_MS = 1000;
 static constexpr uint32_t MIN_REPORT_MS     = 500;
+static constexpr uint32_t MIN_SLEEP_REPORT_INTERVAL_MS = 30000;
 static constexpr uint16_t DEFAULT_SAMPLE_RATE_HZ = 100;
 static constexpr uint16_t MIN_SAMPLE_RATE_HZ     = 1;
 static constexpr uint16_t MAX_SAMPLE_RATE_HZ     = 200;

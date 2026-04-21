@@ -6,6 +6,15 @@ class ChannelUiMixin:
     def channel_record_cell(self, ch_idx):
         return "\u2611" if self.channel_record_enabled[ch_idx] else "\u2610"
 
+    def channel_sleep_cell(self, ch_idx):
+        if ch_idx < self.ARDUINO_CHANNEL_COUNT:
+            return ""
+        node_id = self.find_esp_node_id_by_slot(ch_idx)
+        if node_id is None:
+            return "-"
+        state = self.esp_node_state.get(node_id, {})
+        return "\u2611" if state.get("sleep_enabled", False) else "\u2610"
+
     def update_channel_tree_row(self, ch_idx, temp_display=None, hum_display=None, signal_display=None):
         row_id = "ch{0}".format(ch_idx)
         if not self.tree.exists(row_id):
@@ -16,15 +25,16 @@ class ChannelUiMixin:
                 return
         cur = self.tree.item(row_id, "values")
         if temp_display is None:
-            temp_display = cur[3] if len(cur) > 3 else "-"
+            temp_display = cur[4] if len(cur) > 4 else "-"
         if hum_display is None:
-            hum_display = cur[4] if len(cur) > 4 else "-"
+            hum_display = cur[5] if len(cur) > 5 else "-"
         if signal_display is None:
-            signal_display = cur[5] if len(cur) > 5 else "-"
+            signal_display = cur[6] if len(cur) > 6 else "-"
         self.tree.item(
             row_id,
             values=(
                 self.channel_record_cell(ch_idx),
+                self.channel_sleep_cell(ch_idx),
                 self.channel_display_id(ch_idx),
                 self.channel_tree_name(ch_idx),
                 temp_display,
@@ -44,18 +54,23 @@ class ChannelUiMixin:
         if not row_id:
             return
         col = self.tree.identify_column(event.x)
-        if col != "#1":  # rec column
+        if col not in ("#1", "#2"):
             return
         try:
             ch_idx = int(row_id.replace("ch", ""))
         except ValueError:
             return
-        self.set_channel_recording(ch_idx, not self.channel_record_enabled[ch_idx])
+        if col == "#1":
+            self.set_channel_recording(ch_idx, not self.channel_record_enabled[ch_idx])
+        elif ch_idx >= self.ARDUINO_CHANNEL_COUNT:
+            node_id = self.find_esp_node_id_by_slot(ch_idx)
+            state = self.esp_node_state.get(node_id, {}) if node_id is not None else {}
+            self.send_satellite_sleep(ch_idx, not bool(state.get("sleep_enabled", False)), parent=self.root)
         return "break"
 
     def on_tree_double_click(self, event):
         col = self.tree.identify_column(event.x)
-        if col == "#1":
+        if col in ("#1", "#2"):
             return "break"
         item = self.tree.identify_row(event.y)
         if not item:

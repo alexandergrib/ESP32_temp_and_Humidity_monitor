@@ -38,6 +38,45 @@ python -m platformio run -e satellite_upload -t upload
 
 If PlatformIO does not auto-detect the correct board, pass a local upload port with `--upload-port`, for example `--upload-port COM6`.
 
+## Desktop App Build
+
+The Windows desktop logger lives in `Temp_and_HumidityLogger/` and is packaged with PyInstaller.
+
+Create the app virtual environment and install dependencies:
+
+```powershell
+cd Temp_and_HumidityLogger
+python -m venv venv
+.\venv\Scripts\activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Run from source:
+
+```powershell
+python -m temp_humidity_logger.main
+```
+
+Build the executable:
+
+```powershell
+.\build_exe.ps1 -Clean
+```
+
+Batch wrapper:
+
+```bash
+./Temp_and_HumidityLogger/build_exe.bat -Clean
+```
+
+Output:
+
+- `Temp_and_HumidityLogger\dist\TempHumidityLogger\TempHumidityLogger.exe`
+- bundled libraries under `Temp_and_HumidityLogger\dist\TempHumidityLogger\libraries\`
+
+The package is built as `--onedir`, not `--onefile`. Packaged runtime data is stored in `%LOCALAPPDATA%\TempHumidityLogger`, so rebuilds do not overwrite local `config.ini`, `logger.db`, or CSV exports.
+
 ## Automated Checks
 
 Run app tests, UI smoke tests, firmware static checks, and Python compile checks:
@@ -98,6 +137,11 @@ python pc_logger\ota_satellite.py --port COM6 --node-id 1 --firmware .pio\build\
 ```
 ```bash
 python pc_logger\ota_satellite.py --port COM6 --node-id 2 --firmware .pio\build\satellite_upload\firmware.bin
+```
+Flash controller over USB:
+
+```bash
+python -m platformio run -e controller_upload -t upload
 ```
 
 Run OTA one satellite at a time.

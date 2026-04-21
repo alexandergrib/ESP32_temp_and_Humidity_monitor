@@ -4,7 +4,7 @@ old C-sharm
 __pycache__/
 build/
 dist/TempHumidityLogger/
-log*
+/log*
 data.csv
 data*_temperature.csv
 data*_humidity.csv

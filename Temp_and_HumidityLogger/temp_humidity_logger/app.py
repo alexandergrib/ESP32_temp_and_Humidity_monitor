@@ -333,6 +333,9 @@ class ArduinoLoggerApp(
                 parent=parent,
             )
             return False
+        if enabled and not self.sleep_enable_interval_ok():
+            self.warn_sleep_interval_too_short(parent=parent)
+            return False
         command_value = "ON" if enabled else "OFF"
         command = "SLEEP {0} {1}".format(node_id, command_value)
         if self.send_esp_command(command):
@@ -342,6 +345,7 @@ class ArduinoLoggerApp(
             slot_idx = state.get("slot_idx")
             if slot_idx is not None:
                 self.update_channel_tree_row(slot_idx, signal_display=self.current_signals[slot_idx])
+            self.refresh_sleep_all_menu_state()
             self.send_esp_command("NODES")
             return True
         messagebox.showwarning(
@@ -386,6 +390,7 @@ class ArduinoLoggerApp(
             hum_display = "{0} %".format(self.current_hums[ch_idx])
         return (
             self.channel_record_cell(ch_idx),
+            self.channel_sleep_cell(ch_idx),
             self.channel_display_id(ch_idx),
             self.channel_tree_name(ch_idx),
             temp_display,
@@ -703,6 +708,12 @@ class ArduinoLoggerApp(
             variable=self.terminal_floating_var,
             command=self.on_terminal_floating_toggle
         )
+        self.sleep_all_var = tk.BooleanVar(value=False)
+        settings_menu.add_checkbutton(
+            label="Satellite sleep mode",
+            variable=self.sleep_all_var,
+            command=self.on_sleep_all_toggle
+        )
         settings_menu.add_separator()
         settings_menu.add_command(
             label="Temperature calibration...",
@@ -737,21 +748,27 @@ class ArduinoLoggerApp(
         self.live_split.add(self.live_right, minsize=280)
         self.root.after(10, self._apply_initial_live_layout)
 
-        self.tree = ttk.Treeview(self.live_left, columns=("rec", "id", "name", "temp", "hum", "signal"), show="headings")
+        self.tree = ttk.Treeview(
+            self.live_left,
+            columns=("rec", "sleep", "id", "name", "temp", "hum", "signal"),
+            show="headings",
+        )
         self.tree.heading("rec", text="Active")
+        self.tree.heading("sleep", text="Sleep")
         self.tree.heading("id", text="ID")
         self.tree.heading("name", text="Name  (double-click to edit)")
         self.tree.heading("temp", text="Temp")
         self.tree.heading("hum", text="Hum")
         self.tree.heading("signal", text="Signal")
         self.tree.column("rec", width=64, anchor="center")
+        self.tree.column("sleep", width=58, anchor="center")
         self.tree.column("id", width=60, anchor="center")
         self.tree.column("name", width=220, anchor="w")
         self.tree.column("temp", width=120, anchor="center")
         self.tree.column("hum", width=120, anchor="center")
         self.tree.column("signal", width=120, anchor="center")
         for col_id, width_value in self.saved_column_widths.items():
-            if col_id in ("rec", "id", "name", "temp", "hum", "signal"):
+            if col_id in ("rec", "sleep", "id", "name", "temp", "hum", "signal"):
                 self.tree.column(col_id, width=width_value)
         self.tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.tree.bind("<Button-1>", self.on_tree_click)

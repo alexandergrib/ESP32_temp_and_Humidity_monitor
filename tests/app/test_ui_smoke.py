@@ -56,6 +56,20 @@ class UiSmokeTests(unittest.TestCase):
         self.assertIn(version.APP_VERSION, captured["message"])
         self.assertIn(version.GITHUB_URL, captured["message"])
 
+    def test_windows_build_uses_app_icon(self):
+        build_script = (LOGGER_ROOT / "build_exe.ps1").read_text(encoding="utf-8")
+        spec = (LOGGER_ROOT / "TempHumidityLogger.spec").read_text(encoding="utf-8")
+        icon = LOGGER_ROOT / "icons" / "logo.ico"
+
+        self.assertIn('--icon "icons\\logo.ico"', build_script)
+        self.assertIn('--add-data "icons\\logo.ico;icons"', build_script)
+        self.assertIn('--add-data "icons\\logo1.png;icons"', build_script)
+        self.assertIn("icon=['icons\\\\logo.ico']", spec)
+        with icon.open("rb") as fh:
+            header = fh.read(6)
+        self.assertEqual(header[:4], b"\x00\x00\x01\x00")
+        self.assertGreaterEqual(int.from_bytes(header[4:6], "little"), 5)
+
     def test_tk_app_starts_and_closes(self):
         try:
             import tkinter as tk

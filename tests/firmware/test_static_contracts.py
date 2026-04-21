@@ -49,6 +49,17 @@ class FirmwareStaticContractTests(unittest.TestCase):
         for token in ("reportIntervalMs", "sleepEnabled", "nodeId", "temperatureC", "humidityPct"):
             self.assertIn(token, source)
 
+    def test_sleep_mode_requires_long_report_interval(self):
+        shared_protocol = self.read("shared/protocol.h")
+        controller = self.read("controller/controller.ino")
+        satellite = self.read("satellite/satellite.ino")
+
+        self.assertIn("MIN_SLEEP_REPORT_INTERVAL_MS = 30000", shared_protocol)
+        self.assertIn("sleepAllowedForReportInterval", controller)
+        self.assertIn("interval_too_short", controller)
+        self.assertIn("sleepAllowedForReportInterval", satellite)
+        self.assertIn("effectiveSleepEnabled()", satellite)
+
     def test_shared_protocol_header_has_message_types(self):
         header = self.read("shared/protocol.h")
         for token in ("MSG_READING", "MSG_CONFIG_SET", "MSG_CONFIG_ACK", "MSG_RENAME_SET", "MSG_RENAME_ACK"):

@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('icons\\logo.png', 'icons')]
+datas = [('icons\\logo.ico', 'icons'), ('icons\\logo.png', 'icons'), ('icons\\logo1.png', 'icons')]
 binaries = []
 hiddenimports = ['tkinter', '_tkinter', 'serial.tools.list_ports', 'serial.tools.list_ports_common', 'serial.tools.list_ports_windows']
 tmp_ret = collect_all('matplotlib')
@@ -55,6 +55,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['icons\\logo.ico'],
     contents_directory='libraries',
 )
 coll = COLLECT(

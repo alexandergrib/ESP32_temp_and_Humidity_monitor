@@ -3,6 +3,7 @@ from datetime import datetime
 from unittest.mock import patch
 
 from tests.support.path_setup import LOGGER_ROOT  # noqa: F401
+from temp_humidity_logger.channels import ChannelUiMixin
 from temp_humidity_logger.esp_controller import EspControllerMixin
 
 
@@ -35,15 +36,20 @@ class EspHarness(EspControllerMixin):
         self.markers = []
         self.saved = []
         self.redraws = 0
+        self.console = []
+        self.interval_ms = 30000
 
     def current_interval_ms(self):
-        return 1000
+        return self.interval_ms
 
     def update_channel_tree_row(self, *args, **kwargs):
         pass
 
     def refresh_legend(self):
         pass
+
+    def append_console(self, text):
+        self.console.append(text)
 
     def add_auto_marker(self, note, dt=None):
         self.markers.append((note, dt))
@@ -82,6 +88,49 @@ class EspHarness(EspControllerMixin):
         return True
 
 
+class BoolVarStub:
+    def __init__(self, value=False):
+        self.value = bool(value)
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = bool(value)
+
+
+class ChannelHarness(ChannelUiMixin):
+    ARDUINO_CHANNEL_COUNT = 6
+
+    def __init__(self):
+        class Tree:
+            def __init__(self):
+                self.column = "#2"
+                self.row = "ch6"
+
+            def identify_row(self, y):
+                return self.row
+
+            def identify_column(self, x):
+                return self.column
+
+        self.root = object()
+        self.tree = Tree()
+        self.esp_node_state = {2: {"sleep_enabled": True}}
+        self.esp_slot_by_node_id = {2: 6}
+        self.sleep_commands = []
+
+    def find_esp_node_id_by_slot(self, ch_idx):
+        for node_id, slot_idx in self.esp_slot_by_node_id.items():
+            if slot_idx == ch_idx:
+                return node_id
+        return None
+
+    def send_satellite_sleep(self, ch_idx, enabled, parent=None):
+        self.sleep_commands.append((ch_idx, enabled, parent))
+        return True
+
+
 class EspControllerTests(unittest.TestCase):
     def test_presence_timeout_scales_with_interval(self):
         harness = EspHarness()
@@ -94,6 +143,87 @@ class EspControllerTests(unittest.TestCase):
         with patch("temp_humidity_logger.esp_controller.time.monotonic", return_value=101.0):
             harness.apply_esp_interval_change_grace(state, 20000, 1000)
         self.assertGreater(state["presence_grace_until_monotonic"], 101.0)
+
+    def test_set_all_satellite_sleep_sends_controller_command(self):
+        harness = EspHarness()
+        harness.sleep_all_var = BoolVarStub(False)
+        state = harness.ensure_esp_node_state(2)
+        state["slot_idx"] = harness.ARDUINO_CHANNEL_COUNT
+
+        self.assertTrue(harness.set_all_satellite_sleep(True))
+
+        self.assertIn(("cmd", "SLEEP ALL ON"), harness.saved)
+        self.assertIn(("cmd", "NODES"), harness.saved)
+        self.assertTrue(state["sleep_enabled"])
+        self.assertTrue(harness.sleep_all_var.get())
+
+    def test_set_all_satellite_sleep_requires_esp_connection(self):
+        harness = EspHarness()
+        harness.source_connected["esp"] = False
+
+        with patch("temp_humidity_logger.esp_controller.messagebox.showwarning") as showwarning:
+            self.assertFalse(harness.set_all_satellite_sleep(True))
+
+        showwarning.assert_called_once()
+        self.assertFalse(any(item == ("cmd", "SLEEP ALL ON") for item in harness.saved))
+
+    def test_set_all_satellite_sleep_rejects_short_interval(self):
+        harness = EspHarness()
+        harness.interval_ms = 1000
+
+        with patch("temp_humidity_logger.esp_controller.messagebox.showwarning") as showwarning:
+            self.assertFalse(harness.set_all_satellite_sleep(True))
+
+        showwarning.assert_called_once()
+        self.assertFalse(any(item == ("cmd", "SLEEP ALL ON") for item in harness.saved))
+
+    def test_short_interval_clears_known_sleep_state(self):
+        harness = EspHarness()
+        harness.sleep_all_var = BoolVarStub(True)
+        state = harness.ensure_esp_node_state(2)
+        state["slot_idx"] = harness.ARDUINO_CHANNEL_COUNT
+        state["sleep_enabled"] = True
+
+        self.assertTrue(harness.apply_esp_interval(1000))
+
+        self.assertFalse(state["sleep_enabled"])
+        self.assertFalse(harness.sleep_all_var.get())
+        self.assertIn("ESP sleep mode disabled because interval is below 30s", harness.console)
+
+    def test_sleep_menu_state_reflects_known_satellite_states(self):
+        harness = EspHarness()
+        harness.sleep_all_var = BoolVarStub(False)
+        one = harness.ensure_esp_node_state(1)
+        one["slot_idx"] = harness.ARDUINO_CHANNEL_COUNT
+        one["sleep_enabled"] = True
+        two = harness.ensure_esp_node_state(2)
+        two["slot_idx"] = harness.ARDUINO_CHANNEL_COUNT + 1
+        two["sleep_enabled"] = False
+
+        harness.refresh_sleep_all_menu_state()
+        self.assertFalse(harness.sleep_all_var.get())
+
+        two["sleep_enabled"] = True
+        harness.refresh_sleep_all_menu_state()
+        self.assertTrue(harness.sleep_all_var.get())
+
+    def test_channel_sleep_cell_reflects_satellite_state(self):
+        harness = ChannelHarness()
+
+        self.assertEqual(harness.channel_sleep_cell(0), "")
+        self.assertEqual(harness.channel_sleep_cell(6), "\u2611")
+        self.assertEqual(harness.channel_sleep_cell(7), "-")
+
+        harness.esp_node_state[2]["sleep_enabled"] = False
+        self.assertEqual(harness.channel_sleep_cell(6), "\u2610")
+
+    def test_channel_sleep_column_click_toggles_satellite_sleep(self):
+        harness = ChannelHarness()
+
+        result = harness.on_tree_click(type("Event", (), {"x": 1, "y": 1})())
+
+        self.assertEqual(result, "break")
+        self.assertEqual(harness.sleep_commands, [(6, False, harness.root)])
 
     def test_node_bound_counts_as_online_without_offline_marker(self):
         harness = EspHarness()

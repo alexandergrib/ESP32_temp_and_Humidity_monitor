@@ -3,11 +3,28 @@
 import math
 import time
 from datetime import datetime
+from tkinter import messagebox
 
 from .esp_events import parse_esp_event_json
 
 
 class EspControllerMixin:
+    MIN_SLEEP_INTERVAL_MS = 30000
+
+    def sleep_enable_interval_ok(self):
+        try:
+            return int(self.current_interval_ms()) >= int(self.MIN_SLEEP_INTERVAL_MS)
+        except Exception:
+            return False
+
+    def warn_sleep_interval_too_short(self, parent=None):
+        messagebox.showwarning(
+            "Sleep Control",
+            "Sleep mode requires a report interval of at least 30s. "
+            "Increase the interval before enabling sleep mode.",
+            parent=parent,
+        )
+
     def default_esp_report_interval_ms(self):
         try:
             return max(250, int(self.current_interval_ms()))
@@ -189,12 +206,23 @@ class EspControllerMixin:
             return False
         if self.send_esp_command("SETINT ALL {0}".format(interval_ms)):
             normalized_interval_ms = max(250, int(interval_ms))
+            sleep_disabled = normalized_interval_ms < self.MIN_SLEEP_INTERVAL_MS
             for state in self.esp_node_state.values():
                 old_interval_ms = state.get("report_interval_ms") or self.default_esp_report_interval_ms()
                 self.apply_esp_interval_change_grace(state, old_interval_ms, normalized_interval_ms)
                 state["report_interval_ms"] = normalized_interval_ms
+                if sleep_disabled:
+                    state["sleep_enabled"] = False
+                    slot_idx = state.get("slot_idx")
+                    if slot_idx is not None:
+                        slot_idx = int(slot_idx)
+                        self.update_channel_tree_row(slot_idx, signal_display=self.current_signals[slot_idx])
             if log_to_console:
                 self.append_console(">>> [ESP] SETINT ALL {0}".format(interval_ms))
+                if sleep_disabled:
+                    self.append_console("ESP sleep mode disabled because interval is below 30s")
+            if sleep_disabled:
+                self.refresh_sleep_all_menu_state()
             return True
         return False
 
@@ -209,6 +237,56 @@ class EspControllerMixin:
                 self.append_console(">>> [ESP] TIME SET {0}".format(unix_time))
             return True
         return False
+
+
+    def set_all_satellite_sleep(self, enabled, parent=None):
+        if not self.source_connected["esp"]:
+            messagebox.showwarning(
+                "Sleep Control",
+                "ESP controller is not connected.",
+                parent=parent,
+            )
+            return False
+        if enabled and not self.sleep_enable_interval_ok():
+            self.warn_sleep_interval_too_short(parent=parent)
+            return False
+        command_value = "ON" if enabled else "OFF"
+        command = "SLEEP ALL {0}".format(command_value)
+        if self.send_esp_command(command):
+            self.append_console(">>> [ESP] {0}".format(command))
+            for state in self.esp_node_state.values():
+                state["sleep_enabled"] = bool(enabled)
+                slot_idx = state.get("slot_idx")
+                if slot_idx is not None:
+                    slot_idx = int(slot_idx)
+                    self.update_channel_tree_row(slot_idx, signal_display=self.current_signals[slot_idx])
+            self.refresh_sleep_all_menu_state()
+            self.refresh_legend()
+            self.send_esp_command("NODES")
+            return True
+        messagebox.showwarning(
+            "Sleep Control",
+            "Failed to send sleep command to the ESP controller.",
+            parent=parent,
+        )
+        return False
+
+
+    def on_sleep_all_toggle(self):
+        enabled = bool(self.sleep_all_var.get())
+        if not self.set_all_satellite_sleep(enabled, parent=self.root):
+            self.sleep_all_var.set(not enabled)
+
+
+    def refresh_sleep_all_menu_state(self):
+        if not hasattr(self, "sleep_all_var"):
+            return
+        sleep_states = [
+            bool(state.get("sleep_enabled"))
+            for state in self.esp_node_state.values()
+            if state.get("slot_idx") is not None
+        ]
+        self.sleep_all_var.set(bool(sleep_states) and all(sleep_states))
 
 
     def parse_esp_timestamp(self, event):
@@ -345,6 +423,7 @@ class EspControllerMixin:
                 state["sleep_enabled"] = bool(event.get("sleep_enabled"))
             except Exception:
                 pass
+            self.refresh_sleep_all_menu_state()
             now = self.parse_esp_timestamp(event)
             state["last_seen_monotonic"] = now_monotonic
             state["last_seen_dt"] = now
@@ -416,5 +495,6 @@ class EspControllerMixin:
                 self.update_channel_tree_row(slot_idx, signal_display=self.current_signals[slot_idx])
                 updated_any = True
             if updated_any:
+                self.refresh_sleep_all_menu_state()
                 self.refresh_legend()
 

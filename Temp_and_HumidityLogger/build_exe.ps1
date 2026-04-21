@@ -114,7 +114,10 @@ if (Test-Path $tkDir)  { $env:TK_LIBRARY  = $tkDir }
     --windowed `
     --noupx `
     --name "TempHumidityLogger" `
+    --icon "icons\logo.ico" `
+    --add-data "icons\logo.ico;icons" `
     --add-data "icons\logo.png;icons" `
+    --add-data "icons\logo1.png;icons" `
     --collect-all matplotlib `
     --collect-all numpy `
     --collect-all PIL `

@@ -19,7 +19,6 @@ class SettingsUiMixin:
             parent=self.root,
         )
 
-
     def open_com_settings(self):
         dialog = tk.Toplevel(self.root)
         dialog.title("COM Settings")
@@ -30,7 +29,8 @@ class SettingsUiMixin:
 
         ports = [p.device for p in serial.tools.list_ports.comports()]
 
-        tk.Label(dialog, text="Arduino port:", font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w", padx=12, pady=(14, 8))
+        tk.Label(dialog, text="Arduino port:", font=("Segoe UI", 10)).grid(row=0, column=0, sticky="w", padx=12,
+                                                                           pady=(14, 8))
         arduino_var = tk.StringVar(value=self.cmb_arduino_port.get().strip())
         arduino_combo = ttk.Combobox(dialog, textvariable=arduino_var, values=ports, state="readonly", width=18)
         arduino_combo.grid(row=0, column=1, sticky="w", padx=(0, 12), pady=(14, 8))
@@ -63,7 +63,8 @@ class SettingsUiMixin:
         btn_row = tk.Frame(dialog)
         btn_row.grid(row=4, column=0, columnspan=2, pady=(4, 0))
         tk.Button(btn_row, text="Refresh", command=refresh_dialog_ports, padx=14).pack(side=tk.LEFT, padx=6)
-        tk.Button(btn_row, text="Apply", command=apply_and_close, bg="#4a90d9", fg="white", padx=18).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_row, text="Apply", command=apply_and_close, bg="#4a90d9", fg="white", padx=18).pack(side=tk.LEFT,
+                                                                                                          padx=6)
         tk.Button(btn_row, text="Close", command=dialog.destroy, padx=18).pack(side=tk.LEFT, padx=6)
 
     def open_application_settings(self):
@@ -93,7 +94,8 @@ class SettingsUiMixin:
             "esp_channel_count": tk.StringVar(value=str(self.runtime_settings["esp_channel_count"])),
             "default_interval_text": tk.StringVar(value=str(self.runtime_settings["default_interval_text"])),
             "smoothing_window": tk.StringVar(value=str(self.runtime_settings["smoothing_window"])),
-            "satellite_smoothing_seconds": tk.StringVar(value=str(self.runtime_settings["satellite_smoothing_seconds"])),
+            "satellite_smoothing_seconds": tk.StringVar(
+                value=str(self.runtime_settings["satellite_smoothing_seconds"])),
             "arduino_baud_rate": tk.StringVar(value=str(self.runtime_settings["arduino_baud_rate"])),
             "esp_baud_rate": tk.StringVar(value=str(self.runtime_settings["esp_baud_rate"])),
             "db_file_name": tk.StringVar(value=str(self.runtime_settings["db_file_name"])),
@@ -151,12 +153,14 @@ class SettingsUiMixin:
         def apply_and_close():
             raw_settings = {key: var.get().strip() for key, var in vars_map.items()}
             if self.parse_interval_ms(raw_settings["default_interval_text"]) is None:
-                messagebox.showwarning("Application Settings", "Default interval must use a format like 500ms, 1s, 2min, or 1h.", parent=dialog)
+                messagebox.showwarning("Application Settings",
+                                       "Default interval must use a format like 500ms, 1s, 2min, or 1h.", parent=dialog)
                 return
             for file_key in ("db_file_name", "temp_data_file_name", "hum_data_file_name"):
                 filename = raw_settings[file_key]
                 if not filename or os.path.basename(filename) != filename:
-                    messagebox.showwarning("Application Settings", "Filenames must be plain file names without folders.", parent=dialog)
+                    messagebox.showwarning("Application Settings",
+                                           "Filenames must be plain file names without folders.", parent=dialog)
                     return
 
             new_settings = self.sanitize_runtime_settings(raw_settings)
@@ -186,7 +190,8 @@ class SettingsUiMixin:
 
         btn_row = tk.Frame(dialog)
         btn_row.pack(pady=(0, 10))
-        tk.Button(btn_row, text="Apply", command=apply_and_close, bg="#4a90d9", fg="white", padx=18).pack(side=tk.LEFT, padx=6)
+        tk.Button(btn_row, text="Apply", command=apply_and_close, bg="#4a90d9", fg="white", padx=18).pack(side=tk.LEFT,
+                                                                                                          padx=6)
         tk.Button(btn_row, text="Close", command=dialog.destroy, padx=18).pack(side=tk.LEFT, padx=6)
 
         dialog.wait_window()

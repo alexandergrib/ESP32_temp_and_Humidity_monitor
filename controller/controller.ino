@@ -122,6 +122,10 @@ uint32_t normalizeReportInterval(uint32_t ms) {
     return max(ms, MIN_REPORT_MS);
 }
 
+bool sleepAllowedForReportInterval(uint32_t reportIntervalMs) {
+    return normalizeReportInterval(reportIntervalMs) >= MIN_SLEEP_REPORT_INTERVAL_MS;
+}
+
 uint16_t normalizeSampleRateHz(uint32_t hz) {
     return static_cast<uint16_t>(constrain(hz, MIN_SAMPLE_RATE_HZ, MAX_SAMPLE_RATE_HZ));
 }
@@ -372,7 +376,7 @@ bool effectiveOtaPause(const NodeRecord& node) {
 }
 
 bool effectiveSleepEnabled(const NodeRecord& node) {
-    return node.otaPrepActive ? false : node.sleepEnabled;
+    return node.otaPrepActive ? false : (node.sleepEnabled && sleepAllowedForReportInterval(effectiveReportIntervalMs(node)));
 }
 
 void alignNodeSchedule(NodeRecord& node, uint32_t nowMs, uint32_t minFutureMs = MIN_REPORT_SLOT_GAP_MS) {
@@ -427,7 +431,7 @@ void sendConfig(
     cfg.heaterEnabled = heaterEnabled ? 1 : 0;
     cfg.otaReady = otaReady ? 1 : 0;
     cfg.otaPause = otaPause ? 1 : 0;
-    cfg.sleepEnabled = sleepEnabled ? 1 : 0;
+    cfg.sleepEnabled = (sleepEnabled && sleepAllowedForReportInterval(cfg.reportIntervalMs)) ? 1 : 0;
     cfg.sampleRateHz = normalizeSampleRateHz(sampleRateHz);
     ensurePeer(nodes[idx].mac);
     esp_now_send(nodes[idx].mac, reinterpret_cast<const uint8_t*>(&cfg), sizeof(cfg));
@@ -1062,9 +1066,14 @@ void processSerialCommand(const String& raw) {
         if (cmd.startsWith("SETINT ALL ")) {
             uint32_t ms = normalizeReportInterval(cmd.substring(11).toInt());
             uint32_t appliedCount = 0;
+            uint32_t sleepDisabledCount = 0;
             for (size_t i = 0; i < MAX_NODES; ++i) {
                 if (!nodes[i].used) continue;
                 nodes[i].reportIntervalMs = ms;
+                if (!sleepAllowedForReportInterval(ms) && nodes[i].sleepEnabled) {
+                    nodes[i].sleepEnabled = false;
+                    sleepDisabledCount++;
+                }
                 saveNode(i);
                 appliedCount++;
             }
@@ -1072,7 +1081,8 @@ void processSerialCommand(const String& raw) {
             pushSchedulesToAllNodes();
             printJsonEvent(
                 "{\"event\":\"setint_all\",\"report_interval_ms\":" + String(ms) +
-                ",\"targets\":" + String(appliedCount) + "}",
+                ",\"targets\":" + String(appliedCount) +
+                ",\"sleep_disabled\":" + String(sleepDisabledCount) + "}",
                 true
             );
         } else {
@@ -1083,6 +1093,9 @@ void processSerialCommand(const String& raw) {
                 int idx = findNodeById(nodeId);
                 if (idx >= 0) {
                     nodes[idx].reportIntervalMs = ms;
+                    if (!sleepAllowedForReportInterval(ms)) {
+                        nodes[idx].sleepEnabled = false;
+                    }
                     saveNode(static_cast<size_t>(idx));
                     rebuildReportSchedule();
                     pushSchedulesToAllNodes();
@@ -1130,6 +1143,20 @@ void processSerialCommand(const String& raw) {
                 printPrompt();
                 return;
             }
+            if (enabled) {
+                for (size_t i = 0; i < MAX_NODES; ++i) {
+                    if (!nodes[i].used) continue;
+                    if (!sleepAllowedForReportInterval(effectiveReportIntervalMs(nodes[i]))) {
+                        printJsonEvent(
+                            "{\"event\":\"sleep_error\",\"reason\":\"interval_too_short\",\"min_report_interval_ms\":" +
+                            String(MIN_SLEEP_REPORT_INTERVAL_MS) + "}",
+                            true
+                        );
+                        printPrompt();
+                        return;
+                    }
+                }
+            }
             uint32_t appliedCount = 0;
             for (size_t i = 0; i < MAX_NODES; ++i) {
                 if (!nodes[i].used) continue;
@@ -1152,6 +1179,16 @@ void processSerialCommand(const String& raw) {
                 int idx = findNodeById(nodeId);
                 if (idx >= 0) {
                     if (value.equalsIgnoreCase("ON")) {
+                        if (!sleepAllowedForReportInterval(effectiveReportIntervalMs(nodes[idx]))) {
+                            printJsonEvent(
+                                "{\"event\":\"sleep_error\",\"reason\":\"interval_too_short\",\"node_id\":" +
+                                String(nodeId) +
+                                ",\"min_report_interval_ms\":" + String(MIN_SLEEP_REPORT_INTERVAL_MS) + "}",
+                                true
+                            );
+                            printPrompt();
+                            return;
+                        }
                         nodes[idx].sleepEnabled = true;
                     } else if (value.equalsIgnoreCase("OFF")) {
                         nodes[idx].sleepEnabled = false;

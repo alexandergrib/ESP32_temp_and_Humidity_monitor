@@ -247,6 +247,14 @@ uint32_t normalizeReportInterval(uint32_t ms) {
     return max(ms, MIN_REPORT_MS);
 }
 
+bool sleepAllowedForReportInterval(uint32_t reportMs) {
+    return normalizeReportInterval(reportMs) >= MIN_SLEEP_REPORT_INTERVAL_MS;
+}
+
+bool effectiveSleepEnabled() {
+    return sleepEnabled && sleepAllowedForReportInterval(reportIntervalMs);
+}
+
 uint16_t normalizeSampleRateHz(uint32_t hz) {
     return static_cast<uint16_t>(constrain(hz, MIN_SAMPLE_RATE_HZ, MAX_SAMPLE_RATE_HZ));
 }
@@ -522,20 +530,21 @@ void applyControllerState(
 ) {
     const uint32_t normalizedReportMs = normalizeReportInterval(reportMs);
     const uint16_t normalizedSampleRate = normalizeSampleRateHz(sampleRate);
+    const bool normalizedSleepEnabled = sleepEnabledState && sleepAllowedForReportInterval(normalizedReportMs);
     const bool configChanged =
         reportIntervalMs != normalizedReportMs ||
         sampleRateHz != normalizedSampleRate ||
         tempOffsetC != tempOffset ||
         heaterEnabled != heaterOn ||
         otaReady != otaReadyEnabled ||
-        sleepEnabled != sleepEnabledState;
+        sleepEnabled != normalizedSleepEnabled;
 
     reportIntervalMs = normalizedReportMs;
     sampleRateHz = normalizedSampleRate;
     tempOffsetC = tempOffset;
     heaterEnabled = heaterOn;
     otaReady = otaReadyEnabled;
-    sleepEnabled = sleepEnabledState;
+    sleepEnabled = normalizedSleepEnabled;
     applySensorConfig();
     restartSensorSampler(true);
     captureWindowActive = false;
@@ -614,7 +623,7 @@ void saveConfig() {
     prefs.putUShort("sampleHz", normalizeSampleRateHz(sampleRateHz));
     prefs.putFloat("tempOff", tempOffsetC);
     prefs.putBool("heaterOn", heaterEnabled);
-    prefs.putBool("sleepEn", sleepEnabled);
+    prefs.putBool("sleepEn", effectiveSleepEnabled());
     prefs.putBytes("ctrlMac", controllerMac, 6);
     prefs.putString("name", String(nodeName));
     prefs.end();
@@ -629,6 +638,9 @@ void loadConfig() {
     tempOffsetC = prefs.getFloat("tempOff", 0.0f);
     heaterEnabled = prefs.getBool("heaterOn", false);
     sleepEnabled = prefs.getBool("sleepEn", false);
+    if (!sleepAllowedForReportInterval(reportIntervalMs)) {
+        sleepEnabled = false;
+    }
     prefs.getBytes("ctrlMac", controllerMac, 6);
     String name = prefs.getString("name", DEFAULT_NODE_NAME);
     sanitizeNodeName(name).toCharArray(nodeName, sizeof(nodeName));
@@ -782,7 +794,7 @@ void sendConfigAck(bool applied) {
     msg.applied = applied ? 1 : 0;
     msg.heaterEnabled = heaterEnabled ? 1 : 0;
     msg.otaReady = otaReady ? 1 : 0;
-    msg.sleepEnabled = sleepEnabled ? 1 : 0;
+    msg.sleepEnabled = effectiveSleepEnabled() ? 1 : 0;
     msg.sampleRateHz = normalizeSampleRateHz(sampleRateHz);
     ensurePeer(controllerMac);
     esp_now_send(controllerMac, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
@@ -1103,7 +1115,7 @@ void lightSleepForMs(uint32_t sleepMs) {
 }
 
 void maybeSleep() {
-    if (DEBUG_FORCE_NO_SLEEP || !sleepEnabled) {
+    if (DEBUG_FORCE_NO_SLEEP || !effectiveSleepEnabled()) {
         return;
     }
 
