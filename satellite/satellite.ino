@@ -16,8 +16,6 @@ static constexpr uint32_t SERIAL_BAUD = 460800;
 static constexpr uint8_t PIN_I2C_SDA = 21;
 static constexpr uint8_t PIN_I2C_SCL = 22;
 static constexpr char DEFAULT_NODE_NAME[] = "satellite";
-static constexpr uint8_t FW_VERSION_MAJOR = 2;
-static constexpr uint8_t FW_VERSION_MINOR = 5;
 static constexpr uint32_t SATELLITE_CPU_FREQ_MHZ = 80;
 static constexpr bool DEBUG_FORCE_NO_SLEEP = false;
 
@@ -742,8 +740,8 @@ void sendBindRequest() {
     BindRequest msg{};
     fillHeader(msg.header, MSG_BIND_REQUEST, txSeq++, nodeId, millis());
     strncpy(msg.nodeName, nodeName, sizeof(msg.nodeName) - 1);
-    msg.fwMajor = FW_VERSION_MAJOR;
-    msg.fwMinor = FW_VERSION_MINOR;
+    msg.fwMajor = SATELLITE_FW_VERSION_MAJOR;
+    msg.fwMinor = SATELLITE_FW_VERSION_MINOR;
     msg.capabilities = 0x0001;
     esp_now_send(broadcastMac, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
     noteActivity();
@@ -763,8 +761,8 @@ bool sendReading() {
     msg.vbat = NAN;
     msg.sensorOk = pending->sensorOk;
     msg.rssiHint = 0;
-    msg.reserved[0] = FW_VERSION_MAJOR;
-    msg.reserved[1] = FW_VERSION_MINOR;
+    msg.reserved[0] = SATELLITE_FW_VERSION_MAJOR;
+    msg.reserved[1] = SATELLITE_FW_VERSION_MINOR;
     ensurePeer(controllerMac);
     esp_now_send(controllerMac, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
     pending->lastSendAtMs = millis();
@@ -855,6 +853,9 @@ void handleOtaBegin(const OtaBegin& msg) {
 
     resetOtaState();
     otaState.active = true;
+    captureWindowActive = false;
+    captureWindowEndsAtMs = 0;
+    clearBufferedReadings();
     otaState.totalSize = msg.totalSize;
     otaState.expectedCrc32 = msg.expectedCrc32;
     otaState.runningCrc32 = 0xFFFFFFFF;
@@ -959,8 +960,8 @@ void handleIncomingPacket(const uint8_t* data, int len) {
             "Bound to controller %s as node %lu fw %u.%u heater %s sample %uHz\n",
             macToString(controllerMac).c_str(),
             static_cast<unsigned long>(nodeId),
-            FW_VERSION_MAJOR,
-            FW_VERSION_MINOR,
+            SATELLITE_FW_VERSION_MAJOR,
+            SATELLITE_FW_VERSION_MINOR,
             heaterEnabled ? "on" : "off",
             static_cast<unsigned>(sampleRateHz)
         );
@@ -1198,8 +1199,8 @@ void setup() {
             "Loaded binding: node %lu controller %s fw %u.%u\n",
             static_cast<unsigned long>(nodeId),
             macToString(controllerMac).c_str(),
-            FW_VERSION_MAJOR,
-            FW_VERSION_MINOR
+            SATELLITE_FW_VERSION_MAJOR,
+            SATELLITE_FW_VERSION_MINOR
         );
         sendBindRequest();
         Serial.println("Rebinding with controller...");

@@ -31,6 +31,19 @@ class FirmwareStaticContractTests(unittest.TestCase):
         for command in ("STREAM", "SETINT", "NODES", "TIME", "RENAME", "SLEEP"):
             self.assertIn(command, source)
 
+    def test_ota_suppresses_normal_readings(self):
+        controller = self.read("controller/controller.ino")
+        satellite = self.read("satellite/satellite.ino")
+
+        self.assertIn("suppressNormalReading", controller)
+        self.assertIn("effectiveOtaReady(nodes[idx])", controller)
+        self.assertIn("effectiveOtaPause(nodes[idx])", controller)
+        self.assertIn("clearBufferedReadings();", satellite)
+        self.assertRegex(
+            satellite,
+            re.compile(r"otaState\.active\s*=\s*true;.*clearBufferedReadings\(\);", re.DOTALL),
+        )
+
     def test_satellite_firmware_has_expected_config_fields(self):
         source = self.read("satellite/satellite.ino")
         for token in ("reportIntervalMs", "sleepEnabled", "nodeId", "temperatureC", "humidityPct"):
@@ -40,6 +53,37 @@ class FirmwareStaticContractTests(unittest.TestCase):
         header = self.read("shared/protocol.h")
         for token in ("MSG_READING", "MSG_CONFIG_SET", "MSG_CONFIG_ACK", "MSG_RENAME_SET", "MSG_RENAME_ACK"):
             self.assertIn(token, header)
+
+    def test_firmware_versions_manifest_matches_sources(self):
+        manifest = self.read("FIRMWARE_VERSIONS.md")
+        version_header = self.read("shared/firmware_versions.h")
+        shared_protocol = self.read("shared/protocol.h")
+        controller_protocol = self.read("controller/protocol.h")
+        satellite_protocol = self.read("satellite/protocol.h")
+        satellite = self.read("satellite/satellite.ino")
+        nano = self.read("arduino nano/Temp_Humidity_Sensing/Temp_Humidity_Sensing.ino")
+
+        protocol_match = re.search(r"FIRMWARE_PROTOCOL_VERSION\s*=\s*(\d+)", version_header)
+        sat_major_match = re.search(r"SATELLITE_FW_VERSION_MAJOR\s*=\s*(\d+)", version_header)
+        sat_minor_match = re.search(r"SATELLITE_FW_VERSION_MINOR\s*=\s*(\d+)", version_header)
+        nano_match = re.search(r'ARDUINO_NANO_FW_VERSION\[\]\s*=\s*"([^"]+)"', version_header)
+
+        self.assertIsNotNone(protocol_match)
+        self.assertIsNotNone(sat_major_match)
+        self.assertIsNotNone(sat_minor_match)
+        self.assertIsNotNone(nano_match)
+        for protocol in (shared_protocol, controller_protocol, satellite_protocol):
+            self.assertIn("firmware_versions.h", protocol)
+            self.assertIn("PROTOCOL_VERSION = FIRMWARE_PROTOCOL_VERSION", protocol)
+        self.assertIn("SATELLITE_FW_VERSION_MAJOR", satellite)
+        self.assertIn("SATELLITE_FW_VERSION_MINOR", satellite)
+        self.assertIn("proto::ARDUINO_NANO_FW_VERSION", nano)
+        self.assertIn("protocol {0}".format(protocol_match.group(1)), manifest)
+        self.assertIn(
+            "{0}.{1}".format(sat_major_match.group(1), sat_minor_match.group(1)),
+            manifest,
+        )
+        self.assertIn(nano_match.group(1), manifest)
 
 
 if __name__ == "__main__":

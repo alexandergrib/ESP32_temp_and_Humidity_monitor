@@ -1,10 +1,11 @@
 #pragma once
 
 #include <Arduino.h>
+#include "firmware_versions.h"
 
 namespace proto {
 
-static constexpr uint16_t PROTOCOL_VERSION = 9;
+static constexpr uint16_t PROTOCOL_VERSION = FIRMWARE_PROTOCOL_VERSION;
 static constexpr uint8_t  RADIO_CHANNEL     = 6;   // must match on all nodes
 static constexpr uint32_t DEFAULT_REPORT_MS = 1000;
 static constexpr uint32_t MIN_REPORT_MS     = 500;

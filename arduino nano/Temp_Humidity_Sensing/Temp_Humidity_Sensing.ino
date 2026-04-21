@@ -1,5 +1,6 @@
 #include <Wire.h>
 #include <ctype.h>
+#include "../../shared/firmware_versions.h"
 
 #define MUX_ADDR 0x70
 #define STH85_ADDR 0x44
@@ -27,7 +28,7 @@ const uint16_t SERIAL_IDLE_DELAY_MS = 5;
 const uint32_t I2C_CLOCK_HZ = 50000;
 const uint8_t CMD_BUFFER_LEN = 32;
 const char *ARDUINO_BOARD = "nano_every";
-const char *ARDUINO_FW_VERSION = "nano-sth85-json-1.0";
+const char *ARDUINO_FW_VERSION = proto::ARDUINO_NANO_FW_VERSION;
 
 uint8_t handshakeComplete = 0;
 char cmdBuffer[CMD_BUFFER_LEN];

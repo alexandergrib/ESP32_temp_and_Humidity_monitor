@@ -735,7 +735,15 @@ void handleReading(const uint8_t* mac, const Reading& msg, int8_t rssiDbm) {
     int idx = findNodeByMac(mac);
     if (idx < 0) return;
     nodes[idx].lastSeenMs = millis();
+    const bool suppressNormalReading =
+        effectiveOtaReady(nodes[idx]) ||
+        effectiveOtaPause(nodes[idx]) ||
+        (otaSession.active && nodes[idx].nodeId == otaSession.nodeId);
     if (nodes[idx].lastDeliveredReadingSeq == msg.header.sequence) {
+        sendReadingAck(static_cast<size_t>(idx), msg.header.sequence);
+        return;
+    }
+    if (suppressNormalReading) {
         sendReadingAck(static_cast<size_t>(idx), msg.header.sequence);
         return;
     }
