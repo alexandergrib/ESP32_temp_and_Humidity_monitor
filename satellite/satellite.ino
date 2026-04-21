@@ -308,6 +308,14 @@ void clearBufferedChunks() {
     rollingChunkCount = 0;
 }
 
+void clearBufferedReadings() {
+    for (BufferedReading& item : readingBuffer) {
+        item = BufferedReading{};
+    }
+    readingBufferHead = 0;
+    readingBufferCount = 0;
+}
+
 void trimRollingChunks(uint32_t nowUs) {
     const uint32_t windowUs = averagingWindowUs();
     while (rollingChunkCount > 0) {
@@ -534,6 +542,9 @@ void applyControllerState(
     restartSensorSampler(true);
     captureWindowActive = false;
     captureWindowEndsAtMs = 0;
+    if (otaReadyEnabled) {
+        clearBufferedReadings();
+    }
     scheduleNextReport(nextDelayMs);
     lastControllerContactAtMs = millis();
     lastRecoveryBindAttemptAtMs = 0;
@@ -1035,7 +1046,7 @@ void logSendStatus(esp_now_send_status_t status) {
 }
 
 void queueScheduledReadingsIfDue() {
-    if (!isBound || otaState.active) {
+    if (!isBound || otaState.active || otaReady) {
         return;
     }
     if (captureWindowActive || readingBufferCount >= READING_BUFFER_CAPACITY) {
@@ -1047,7 +1058,7 @@ void queueScheduledReadingsIfDue() {
 }
 
 void serviceReadingDelivery() {
-    if (!isBound || otaState.active) {
+    if (!isBound || otaState.active || otaReady) {
         return;
     }
     BufferedReading* pending = oldestBufferedReading();

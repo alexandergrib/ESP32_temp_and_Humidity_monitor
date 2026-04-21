@@ -23,6 +23,9 @@ esp32_temp_monitor/
 |- pio_controller_src/          Alternate PlatformIO controller source
 |- pc_logger/                   CLI helpers for controller terminal and OTA
 |- Temp_and_HumidityLogger/     Tkinter + Matplotlib desktop logger
+|- tests/                       App and firmware automated tests
+|- run_tests.py                 Test runner for app, UI smoke, and firmware checks
+|- TESTING.md                   Test workflow and coverage notes
 |- platformio.ini               PlatformIO environments
 ```
 
@@ -124,6 +127,21 @@ python pc_logger\controller_terminal.py --port COM6
 
 It opens the serial port, pushes current PC time to the controller, and provides interactive command entry.
 
+Rename one or more satellites without entering the interactive terminal:
+
+```bash
+python pc_logger\controller_terminal.py --port COM6 --rename 3 "Boiler Room"
+python pc_logger\controller_terminal.py --port COM6 --rename 3 "Boiler Room" --rename 4 "Outdoor Rack"
+```
+
+Interactive helper commands:
+
+- `/sync` resend the current PC time with `TIME SET`
+- `/rename <nodeId> <name>` sanitize the name and send `RENAME`
+- `/quit` close the terminal
+
+Any other line is forwarded directly to the controller command parser.
+
 ### Satellite OTA
 
 The OTA helper is in `pc_logger/ota_satellite.py`.
@@ -138,6 +156,25 @@ python pc_logger\ota_satellite.py --port COM6 --node-id 2 --firmware .pio\build\
 
 Run OTA one satellite at a time.
 
+Optional arguments:
+
+- `--baud 460800` override the controller serial baud rate
+
+The OTA helper automatically enables streaming and uses `OTA PREP <nodeId> ON|OFF` to put the target satellite into OTA-accept mode. In that mode the controller pushes settings that mark the node OTA-ready, force sleep off, switch to a quiet OTA report interval, and suppress normal reading delivery until OTA prep is turned off.
+
+Manual OTA preparation from the controller terminal:
+
+```text
+OTA PREP 1 ON
+OTA STATUS
+OTA BEGIN 1 <size> <crc32hex>
+...
+OTA END
+OTA PREP 1 OFF
+```
+
+`OTA PREP` is the high-level command intended for real OTA uploads. `OTA READY` is still available as a lower-level flag toggle, but it does not apply the full quiet-mode profile by itself.
+
 ### Desktop Logger
 
 The desktop GUI lives in `Temp_and_HumidityLogger/`.
@@ -151,6 +188,10 @@ It provides:
 - Marker annotations
 - Split temperature and humidity tabs
 - COM-port control for Arduino and ESP controller sources
+- Satellite-aware smoothing and presence/offline handling
+- App version shown in the window title and App info dialog
+
+The logger entry point remains `arduino_logger_v72.py`, but the implementation is now split into modules under `Temp_and_HumidityLogger/temp_humidity_logger/`.
 
 Setup:
 
@@ -164,6 +205,22 @@ python arduino_logger_v72.py
 
 Packaging instructions are documented in [Temp_and_HumidityLogger/README.md](/C:/Users/LENOVO/Downloads/esp32_temp_monitor-20260414T164103Z-3-001/esp32_temp_monitor/Temp_and_HumidityLogger/README.md).
 
+## Testing
+
+Run fast local checks:
+
+```bash
+python run_tests.py --suite fast
+```
+
+Run the full suite, including PlatformIO controller and satellite builds:
+
+```bash
+python run_tests.py --suite all
+```
+
+Detailed test coverage and suite filters are documented in [TESTING.md](/C:/Users/LENOVO/Downloads/esp32_temp_monitor-20260414T164103Z-3-001/esp32_temp_monitor/TESTING.md).
+
 ## Large Dataset Note
 
 The desktop logger now caches per-channel downsampled chart data before redraw, which keeps pan/zoom and redraws responsive even when session history grows very large. Extremely large session loads can still be limited by database read time rather than chart rendering.
@@ -172,27 +229,31 @@ The desktop logger now caches per-channel downsampled chart data before redraw, 
 
 Available controller commands:
 
-- `HELP`
-- `NODES`
-- `BIND`
-- `BIND OFF`
-- `STREAM ON`
-- `STREAM OFF`
-- `SETINT <nodeId> <ms>`
-- `SETINT ALL <ms>`
-- `SETSAMPLE <nodeId> <hz>`
-- `SETSAMPLE ALL <hz>`
-- `SETTOFF <nodeId> <tempOffsetC>`
-- `HEATER <nodeId> ON`
-- `HEATER <nodeId> OFF`
-- `RENAME <nodeId> <name>`
-- `TIME STATUS`
-- `TIME SET <unixSeconds>`
-- `OTA BEGIN <nodeId> <size> <crc32hex>`
-- `OTA CHUNK <offset> <hex>`
-- `OTA END`
-- `OTA STATUS`
-- `OTA ABORT`
+- `HELP` print the controller command list
+- `NODES` print the current node snapshot
+- `BIND` open the bind window for pairing new satellites
+- `BIND OFF` close the bind window
+- `STREAM ON` enable JSON reading/config event output over serial
+- `STREAM OFF` disable streaming output
+- `SETINT <nodeId> <ms>` set one node report interval in milliseconds
+- `SETINT ALL <ms>` set the report interval for every known node
+- `SETSAMPLE <nodeId> <hz>` set one node sample rate in Hz
+- `SETSAMPLE ALL <hz>` set the sample rate for every known node
+- `SLEEP <nodeId> ON|OFF` enable or disable light sleep for one node
+- `SLEEP ALL ON|OFF` enable or disable light sleep for every known node
+- `SETTOFF <nodeId> <tempOffsetC>` store and apply a temperature offset
+- `HEATER <nodeId> ON` enable the SHT85 heater for one node
+- `HEATER <nodeId> OFF` disable the SHT85 heater for one node
+- `RENAME <nodeId> <name>` rename a node with a sanitized ASCII name
+- `TIME STATUS` print controller clock status and ISO timestamp
+- `TIME SET <unixSeconds>` set the controller clock from a Unix timestamp
+- `OTA PREP <nodeId> ON|OFF` enable or disable OTA preparation mode for one node; this applies the OTA-ready flag, forces sleep off, uses the quiet OTA interval, and pauses normal reading delivery until prep is disabled
+- `OTA READY <nodeId> ON|OFF` mark a node ready or not ready for OTA transfer without applying the full OTA prep profile
+- `OTA BEGIN <nodeId> <size> <crc32hex>` begin or resume an OTA session
+- `OTA CHUNK <offset> <hex>` send one OTA data chunk
+- `OTA END` finish the active OTA session
+- `OTA STATUS` print the active OTA state, including whether OTA prep is active for the current target
+- `OTA ABORT` cancel the active OTA session
 
 ## Current Behavior
 

@@ -29,6 +29,7 @@ CHUNK_TIMEOUT_S = 12.0
 END_TIMEOUT_S = 20.0
 HOST_RETRIES = 3
 INTER_CHUNK_DELAY_S = 0.0
+OTA_PREP_REPORT_INTERVAL_MS = 30000
 
 
 def send_command(ser: serial.Serial, command: str) -> None:
@@ -206,6 +207,43 @@ def wait_for_sleep_state(ser: serial.Serial, node_id: int, enabled: bool, timeou
     raise TimeoutError(f"Timed out waiting for node {node_id} sleep_enabled={enabled}")
 
 
+def wait_for_ota_prep_state(ser: serial.Serial, node_id: int, enabled: bool, timeout: float) -> dict:
+    deadline = time.time() + timeout
+    next_probe_at = 0.0
+    while time.time() < deadline:
+        now = time.time()
+        if now >= next_probe_at:
+            send_command(ser, "NODES")
+            next_probe_at = now + 1.0
+        remaining = max(0.1, deadline - time.time())
+        event = read_event(ser, remaining)
+        if event is None:
+            continue
+        if event.get("event") == "ota_prep" and int(event.get("node_id", 0)) == node_id:
+            if bool(event.get("enabled")) == enabled:
+                return event
+        if event.get("event") == "config_ack" and int(event.get("node_id", 0)) == node_id:
+            if enabled:
+                if bool(event.get("ota_ready")) and not bool(event.get("sleep_enabled")):
+                    if int(event.get("report_interval_ms", 0) or 0) == OTA_PREP_REPORT_INTERVAL_MS:
+                        return event
+            else:
+                if not bool(event.get("ota_ready")) and not bool(event.get("ota_prep_active")):
+                    return event
+        if event.get("event") == "nodes":
+            for item in event.get("items", []):
+                if int(item.get("node_id", 0)) != node_id:
+                    continue
+                if enabled:
+                    if bool(item.get("ota_ready")) and not bool(item.get("sleep_enabled")):
+                        if int(item.get("report_interval_ms", 0) or 0) == OTA_PREP_REPORT_INTERVAL_MS:
+                            return item
+                else:
+                    if not bool(item.get("ota_ready")) and not bool(item.get("ota_prep_active")):
+                        return item
+    raise TimeoutError(f"Timed out waiting for node {node_id} ota_prep={enabled}")
+
+
 def wait_for_nodes_snapshot(ser: serial.Serial, timeout: float) -> list[dict]:
     deadline = time.time() + timeout
     next_probe_at = 0.0
@@ -254,33 +292,11 @@ def main() -> int:
         send_command(ser, "STREAM ON")
         send_command(ser, "BIND")
         read_event(ser, 2.0)
-        ready_event = wait_for_node_ready(ser, args.node_id, 20.0)
-        snapshot: list[dict] = []
-        try:
-            snapshot = wait_for_nodes_snapshot(ser, 8.0)
-        except TimeoutError:
-            print(f"Warning: proceeding without full node snapshot for node {args.node_id}")
-        saved_intervals: dict[int, int] = {}
-        saved_sleep_enabled: bool | None = None
+        wait_for_node_ready(ser, args.node_id, 20.0)
         target_prepared = False
-        for item in snapshot:
-            node_id = int(item.get("node_id", 0))
-            interval = int(item.get("report_interval_ms", 30000))
-            saved_intervals[node_id] = interval
-            if node_id == args.node_id:
-                saved_sleep_enabled = bool(item.get("sleep_enabled"))
-            quiet_ms = 30000
-            send_command(ser, f"SETINT {node_id} {quiet_ms}")
-            read_event(ser, 2.0)
-        if saved_sleep_enabled is None:
-            saved_sleep_enabled = bool(ready_event.get("sleep_enabled")) if "sleep_enabled" in ready_event else None
         try:
-            send_command(ser, f"SETINT {args.node_id} 30000")
-            wait_for_node_ready(ser, args.node_id, 20.0)
-            send_command(ser, f"SLEEP {args.node_id} OFF")
-            wait_for_sleep_state(ser, args.node_id, False, 10.0)
-            send_command(ser, f"OTA READY {args.node_id} ON")
-            wait_for_ota_ready_state(ser, args.node_id, True, 10.0)
+            send_command(ser, f"OTA PREP {args.node_id} ON")
+            wait_for_ota_prep_state(ser, args.node_id, True, 12.0)
             target_prepared = True
 
             begin_ack = None
@@ -347,23 +363,11 @@ def main() -> int:
                 raise RuntimeError(json.dumps(end_ack))
         finally:
             if target_prepared:
-                send_command(ser, f"OTA READY {args.node_id} OFF")
+                send_command(ser, f"OTA PREP {args.node_id} OFF")
                 try:
-                    wait_for_ota_ready_state(ser, args.node_id, False, 8.0)
+                    wait_for_ota_prep_state(ser, args.node_id, False, 8.0)
                 except Exception:
                     pass
-                if saved_sleep_enabled:
-                    send_command(ser, f"SLEEP {args.node_id} ON")
-                    try:
-                        wait_for_sleep_state(ser, args.node_id, True, 8.0)
-                    except Exception:
-                        pass
-
-            for node_id, interval in saved_intervals.items():
-                if interval == 30000:
-                    continue
-                send_command(ser, f"SETINT {node_id} {interval}")
-                read_event(ser, 2.0)
 
     print("OTA upload complete")
     return 0

@@ -26,6 +26,8 @@ static constexpr uint32_t SATELLITE_AVERAGING_WINDOW_MAX_MS = 1000;
 static constexpr uint32_t OFFLINE_REPROBE_MS = 2000;
 static constexpr uint32_t OTA_ACK_TIMEOUT_MS = 1500;
 static constexpr uint8_t OTA_MAX_RETRIES = 3;
+static constexpr uint32_t OTA_PREP_REPORT_INTERVAL_MS = 30000;
+static constexpr bool DEFAULT_SLEEP_ENABLED = false;
 static constexpr uint32_t RSSI_CACHE_MAX_AGE_MS = 1500;
 static constexpr size_t RSSI_CACHE_SLOTS = 16;
 static constexpr uint8_t ESPNOW_CATEGORY_CODE = 127;
@@ -48,7 +50,8 @@ struct NodeRecord {
     int8_t lastRssiDbm = 0;
     bool heaterEnabled = false;
     bool otaReady = false;
-    bool sleepEnabled = false;
+    bool sleepEnabled = DEFAULT_SLEEP_ENABLED;
+    bool otaPrepActive = false;
     uint16_t sampleRateHz = DEFAULT_SAMPLE_RATE_HZ;
     float tempOffsetC = 0.0f;
     uint32_t nextReportDelayMs = 0;
@@ -105,6 +108,11 @@ void handleOtaAck(const uint8_t* mac, const OtaAck& ack);
 void handleRenameAck(const uint8_t* mac, const RenameAck& ack);
 void retryPendingOtaFrame();
 void onPromiscuousPacket(void* buf, wifi_promiscuous_pkt_type_t type);
+uint32_t effectiveReportIntervalMs(const NodeRecord& node);
+bool effectiveOtaReady(const NodeRecord& node);
+bool effectiveOtaPause(const NodeRecord& node);
+bool effectiveSleepEnabled(const NodeRecord& node);
+void setNodeOtaPrep(size_t idx, bool enabled, bool pushConfig = true);
 
 bool timeReached(uint32_t now, uint32_t target) {
     return static_cast<int32_t>(now - target) >= 0;
@@ -332,7 +340,7 @@ void loadNodes() {
         nodes[i].fwMinor = prefs.getUChar((base + "fwmin").c_str(), 0);
         nodes[i].tempOffsetC = prefs.getFloat((base + "toff").c_str(), 0.0f);
         nodes[i].heaterEnabled = prefs.getBool((base + "heat").c_str(), false);
-        nodes[i].sleepEnabled = prefs.getBool((base + "sleep").c_str(), false);
+        nodes[i].sleepEnabled = prefs.getBool((base + "sleep").c_str(), DEFAULT_SLEEP_ENABLED);
         nodes[i].sampleRateHz = normalizeSampleRateHz(prefs.getUShort((base + "srhz").c_str(), DEFAULT_SAMPLE_RATE_HZ));
     }
 }
@@ -351,8 +359,24 @@ bool ensurePeer(const uint8_t* mac) {
     return esp_now_add_peer(&peer) == ESP_OK;
 }
 
+uint32_t effectiveReportIntervalMs(const NodeRecord& node) {
+    return normalizeReportInterval(node.otaPrepActive ? OTA_PREP_REPORT_INTERVAL_MS : node.reportIntervalMs);
+}
+
+bool effectiveOtaReady(const NodeRecord& node) {
+    return node.otaPrepActive || node.otaReady;
+}
+
+bool effectiveOtaPause(const NodeRecord& node) {
+    return otaSession.active && node.used && node.nodeId != otaSession.nodeId;
+}
+
+bool effectiveSleepEnabled(const NodeRecord& node) {
+    return node.otaPrepActive ? false : node.sleepEnabled;
+}
+
 void alignNodeSchedule(NodeRecord& node, uint32_t nowMs, uint32_t minFutureMs = MIN_REPORT_SLOT_GAP_MS) {
-    const uint32_t cycleMs = normalizeReportInterval(node.reportIntervalMs);
+    const uint32_t cycleMs = effectiveReportIntervalMs(node);
     const uint32_t earliestSlotAtMs = nowMs + max<uint32_t>(minFutureMs, satelliteCaptureWindowMs(cycleMs));
     if (node.nextScheduledReportAtMs == 0) {
         node.nextScheduledReportAtMs = earliestSlotAtMs;
@@ -368,12 +392,13 @@ void sendBindAck(const uint8_t* mac, size_t idx) {
     BindAck ack{};
     fillHeader(ack.header, MSG_BIND_ACK, txSeq++, node.nodeId, millis());
     ack.assignedNodeId = node.nodeId;
-    ack.reportIntervalMs = normalizeReportInterval(node.reportIntervalMs);
+    ack.reportIntervalMs = effectiveReportIntervalMs(node);
     ack.nextReportDelayMs = nextWakeDelayForNode(idx, ack.header.uptimeMs);
     ack.tempOffsetC = node.tempOffsetC;
     ack.heaterEnabled = node.heaterEnabled ? 1 : 0;
-    ack.otaReady = node.otaReady ? 1 : 0;
-    ack.sleepEnabled = node.sleepEnabled ? 1 : 0;
+    ack.otaReady = effectiveOtaReady(node) ? 1 : 0;
+    ack.otaPause = effectiveOtaPause(node) ? 1 : 0;
+    ack.sleepEnabled = effectiveSleepEnabled(node) ? 1 : 0;
     ack.sampleRateHz = normalizeSampleRateHz(node.sampleRateHz);
     WiFi.macAddress(ack.controllerMac);
     ack.accepted = 1;
@@ -388,6 +413,7 @@ void sendConfig(
     float tempOffsetC,
     bool heaterEnabled,
     bool otaReady,
+    bool otaPause,
     bool sleepEnabled,
     uint16_t sampleRateHz
 ) {
@@ -400,6 +426,7 @@ void sendConfig(
     cfg.tempOffsetC = tempOffsetC;
     cfg.heaterEnabled = heaterEnabled ? 1 : 0;
     cfg.otaReady = otaReady ? 1 : 0;
+    cfg.otaPause = otaPause ? 1 : 0;
     cfg.sleepEnabled = sleepEnabled ? 1 : 0;
     cfg.sampleRateHz = normalizeSampleRateHz(sampleRateHz);
     ensurePeer(nodes[idx].mac);
@@ -410,18 +437,23 @@ void sendNodeConfig(size_t idx) {
     if (idx >= MAX_NODES || !nodes[idx].used) return;
     sendConfig(
         nodes[idx].nodeId,
-        nodes[idx].reportIntervalMs,
+        effectiveReportIntervalMs(nodes[idx]),
         nodes[idx].nextReportDelayMs,
         nodes[idx].tempOffsetC,
         nodes[idx].heaterEnabled,
-        nodes[idx].otaReady,
-        nodes[idx].sleepEnabled,
+        effectiveOtaReady(nodes[idx]),
+        effectiveOtaPause(nodes[idx]),
+        effectiveSleepEnabled(nodes[idx]),
         nodes[idx].sampleRateHz
     );
 }
 
 void setNodeOtaReady(size_t idx, bool enabled, bool pushConfig = true) {
     if (idx >= MAX_NODES || !nodes[idx].used) return;
+    if (nodes[idx].otaPrepActive && !enabled) {
+        setNodeOtaPrep(idx, false, pushConfig);
+        return;
+    }
     nodes[idx].otaReady = enabled;
     if (pushConfig) {
         sendNodeConfig(idx);
@@ -429,6 +461,22 @@ void setNodeOtaReady(size_t idx, bool enabled, bool pushConfig = true) {
     printJsonEvent(
         "{\"event\":\"ota_ready\",\"node_id\":" + String(nodes[idx].nodeId) +
         ",\"enabled\":" + String(enabled ? "true" : "false") + "}",
+        true
+    );
+}
+
+void setNodeOtaPrep(size_t idx, bool enabled, bool pushConfig) {
+    if (idx >= MAX_NODES || !nodes[idx].used) return;
+    nodes[idx].otaPrepActive = enabled;
+    if (pushConfig) {
+        sendNodeConfig(idx);
+    }
+    printJsonEvent(
+        "{\"event\":\"ota_prep\",\"node_id\":" + String(nodes[idx].nodeId) +
+        ",\"enabled\":" + String(enabled ? "true" : "false") +
+        ",\"ota_ready\":" + String(effectiveOtaReady(nodes[idx]) ? "true" : "false") +
+        ",\"sleep_enabled\":" + String(effectiveSleepEnabled(nodes[idx]) ? "true" : "false") +
+        ",\"report_interval_ms\":" + String(effectiveReportIntervalMs(nodes[idx])) + "}",
         true
     );
 }
@@ -452,9 +500,10 @@ void sendReadingAck(size_t idx, uint32_t readingSequence) {
     ack.readingSequence = readingSequence;
     ack.accepted = 1;
     ack.heaterEnabled = nodes[idx].heaterEnabled ? 1 : 0;
-    ack.otaReady = nodes[idx].otaReady ? 1 : 0;
-    ack.sleepEnabled = nodes[idx].sleepEnabled ? 1 : 0;
-    ack.reportIntervalMs = normalizeReportInterval(nodes[idx].reportIntervalMs);
+    ack.otaReady = effectiveOtaReady(nodes[idx]) ? 1 : 0;
+    ack.otaPause = effectiveOtaPause(nodes[idx]) ? 1 : 0;
+    ack.sleepEnabled = effectiveSleepEnabled(nodes[idx]) ? 1 : 0;
+    ack.reportIntervalMs = effectiveReportIntervalMs(nodes[idx]);
     ack.nextReportDelayMs = nextWakeDelayForNode(idx, ack.header.uptimeMs);
     ack.tempOffsetC = nodes[idx].tempOffsetC;
     ack.sampleRateHz = normalizeSampleRateHz(nodes[idx].sampleRateHz);
@@ -507,7 +556,7 @@ bool beginOta(uint32_t nodeId, uint32_t totalSize, uint32_t expectedCrc32) {
 
     int idx = findNodeById(nodeId);
     if (idx < 0) return false;
-    if (!nodes[idx].otaReady) return false;
+    if (!effectiveOtaReady(nodes[idx])) return false;
 
     otaSession.active = true;
     otaSession.nodeId = nodeId;
@@ -544,15 +593,24 @@ bool finishOta() {
     return true;
 }
 
+void refreshOtaPauseState() {
+    pushSchedulesToAllNodes();
+}
+
 void abortOta(const char* reason) {
     if (otaSession.active) {
         int idx = findNodeById(otaSession.nodeId);
         if (idx >= 0) {
-            setNodeOtaReady(static_cast<size_t>(idx), false);
+            if (nodes[idx].otaPrepActive) {
+                setNodeOtaPrep(static_cast<size_t>(idx), false);
+            } else {
+                setNodeOtaReady(static_cast<size_t>(idx), false);
+            }
         }
     }
     printJsonEvent(String("{\"event\":\"ota_aborted\",\"reason\":\"") + reason + "\"}");
     clearOtaSession();
+    refreshOtaPauseState();
 }
 
 void retryPendingOtaFrame() {
@@ -585,7 +643,7 @@ uint32_t nextWakeDelayForNode(size_t idx, uint32_t controllerUptimeMs) {
     }
 
     NodeRecord& node = nodes[idx];
-    const uint32_t cycleMs = normalizeReportInterval(node.reportIntervalMs);
+    const uint32_t cycleMs = effectiveReportIntervalMs(node);
     if (cycleMs == 0) {
         return MIN_REPORT_SLOT_GAP_MS;
     }
@@ -605,7 +663,7 @@ void rebuildReportSchedule() {
     uint32_t cycleMs = activeCount * MIN_REPORT_SLOT_GAP_MS;
     for (const NodeRecord& node : nodes) {
         if (!node.used) continue;
-        cycleMs = max(cycleMs, normalizeReportInterval(node.reportIntervalMs));
+        cycleMs = max(cycleMs, effectiveReportIntervalMs(node));
     }
     const uint32_t spacingMs = max(MIN_REPORT_SLOT_GAP_MS, cycleMs / activeCount);
     const uint32_t nowMs = millis();
@@ -653,6 +711,7 @@ void handleBindRequest(const uint8_t* mac, const BindRequest& req) {
     if (isNewNode) {
         nodes[idx].reportIntervalMs = DEFAULT_REPORT_MS;
         nodes[idx].sampleRateHz = DEFAULT_SAMPLE_RATE_HZ;
+        nodes[idx].sleepEnabled = DEFAULT_SLEEP_ENABLED;
     }
     nodes[idx].lastSeenMs = nowMs;
     saveNode(idx);
@@ -705,22 +764,28 @@ void handleConfigAck(const uint8_t* mac, const ConfigAck& msg) {
     int idx = findNodeByMac(mac);
     if (idx < 0) return;
     nodes[idx].lastSeenMs = millis();
-    nodes[idx].reportIntervalMs = normalizeReportInterval(msg.reportIntervalMs);
+    const uint32_t reportedIntervalMs = normalizeReportInterval(msg.reportIntervalMs);
+    const bool reportedOtaReady = msg.otaReady != 0;
+    const bool reportedSleepEnabled = msg.sleepEnabled != 0;
+    if (!nodes[idx].otaPrepActive) {
+        nodes[idx].reportIntervalMs = reportedIntervalMs;
+        nodes[idx].otaReady = reportedOtaReady;
+        nodes[idx].sleepEnabled = reportedSleepEnabled;
+    }
     nodes[idx].nextReportDelayMs = msg.nextReportDelayMs;
     nodes[idx].tempOffsetC = msg.tempOffsetC;
     nodes[idx].heaterEnabled = msg.heaterEnabled != 0;
-    nodes[idx].otaReady = msg.otaReady != 0;
-    nodes[idx].sleepEnabled = msg.sleepEnabled != 0;
     nodes[idx].sampleRateHz = normalizeSampleRateHz(msg.sampleRateHz);
     saveNode(idx);
     printJsonEvent(
         "{\"event\":\"config_ack\",\"node_id\":" + String(nodes[idx].nodeId) +
-        ",\"report_interval_ms\":" + String(nodes[idx].reportIntervalMs) +
+        ",\"report_interval_ms\":" + String(reportedIntervalMs) +
         ",\"next_report_delay_ms\":" + String(nodes[idx].nextReportDelayMs) +
         ",\"temp_offset_c\":" + String(nodes[idx].tempOffsetC, 2) +
         ",\"heater_enabled\":" + String(nodes[idx].heaterEnabled ? "true" : "false") +
-        ",\"ota_ready\":" + String(nodes[idx].otaReady ? "true" : "false") +
-        ",\"sleep_enabled\":" + String(nodes[idx].sleepEnabled ? "true" : "false") +
+        ",\"ota_ready\":" + String(reportedOtaReady ? "true" : "false") +
+        ",\"sleep_enabled\":" + String(reportedSleepEnabled ? "true" : "false") +
+        ",\"ota_prep_active\":" + String(nodes[idx].otaPrepActive ? "true" : "false") +
         ",\"sample_rate_hz\":" + String(nodes[idx].sampleRateHz) +
         ",\"applied\":" + String(msg.applied ? "true" : "false") + "}"
     );
@@ -791,7 +856,11 @@ void handleOtaAck(const uint8_t* mac, const OtaAck& ack) {
             {
                 int idx = findNodeById(otaSession.nodeId);
                 if (idx >= 0) {
-                    nodes[idx].otaReady = false;
+                    if (nodes[idx].otaPrepActive) {
+                        setNodeOtaPrep(static_cast<size_t>(idx), false, false);
+                    } else {
+                        nodes[idx].otaReady = false;
+                    }
                 }
             }
             printJsonEvent(
@@ -888,18 +957,22 @@ void listNodes() {
         if (!nodes[i].used) continue;
         if (!first) Serial.println(",");
         first = false;
+        const uint32_t effectiveReportMs = effectiveReportIntervalMs(nodes[i]);
+        const bool effectiveReady = effectiveOtaReady(nodes[i]);
+        const bool effectiveSleep = effectiveSleepEnabled(nodes[i]);
         Serial.print("{\"node_id\":"); Serial.print(nodes[i].nodeId);
         Serial.print(",\"name\":\""); Serial.print(nodes[i].name);
         Serial.print("\",\"mac\":\""); Serial.print(macToString(nodes[i].mac));
         Serial.print("\",\"last_seen_ms\":"); Serial.print(nodes[i].lastSeenMs);
-        Serial.print(",\"report_interval_ms\":"); Serial.print(nodes[i].reportIntervalMs);
+        Serial.print(",\"report_interval_ms\":"); Serial.print(effectiveReportMs);
         Serial.print(",\"fw_version\":\""); Serial.print(nodes[i].fwMajor); Serial.print("."); Serial.print(nodes[i].fwMinor); Serial.print("\"");
         Serial.print(",\"rssi_dbm\":"); Serial.print(nodes[i].lastRssiDbm);
         Serial.print(",\"signal_pct\":"); Serial.print(rssiToSignalPercent(nodes[i].lastRssiDbm));
         Serial.print(",\"temp_offset_c\":"); Serial.print(nodes[i].tempOffsetC, 2);
         Serial.print(",\"heater_enabled\":"); Serial.print(nodes[i].heaterEnabled ? "true" : "false");
-        Serial.print(",\"ota_ready\":"); Serial.print(nodes[i].otaReady ? "true" : "false");
-        Serial.print(",\"sleep_enabled\":"); Serial.print(nodes[i].sleepEnabled ? "true" : "false");
+        Serial.print(",\"ota_ready\":"); Serial.print(effectiveReady ? "true" : "false");
+        Serial.print(",\"sleep_enabled\":"); Serial.print(effectiveSleep ? "true" : "false");
+        Serial.print(",\"ota_prep_active\":"); Serial.print(nodes[i].otaPrepActive ? "true" : "false");
         Serial.print(",\"sample_rate_hz\":"); Serial.print(nodes[i].sampleRateHz);
         Serial.print(",\"next_report_delay_ms\":"); Serial.print(nodes[i].nextReportDelayMs);
         Serial.print("}");
@@ -934,7 +1007,7 @@ void processSerialCommand(const String& raw) {
     cmd.trim();
     promptShown = false;
     if (cmd.equalsIgnoreCase("HELP")) {
-        Serial.println("Commands: HELP, NODES, BIND, BIND OFF, SETINT <nodeId> <ms>, SETINT ALL <ms>, SETSAMPLE <nodeId> <hz>, SETSAMPLE ALL <hz>, SLEEP <nodeId> ON|OFF, SLEEP ALL ON|OFF, SETTOFF <nodeId> <tempOffsetC>, HEATER <nodeId> ON|OFF, RENAME <nodeId> <name>, STREAM OFF, STREAM ON, TIME STATUS, TIME SET <unixSeconds>, OTA READY <nodeId> ON|OFF, OTA BEGIN <nodeId> <size> <crc32hex>, OTA CHUNK <offset> <hex>, OTA END, OTA STATUS, OTA ABORT");
+        Serial.println("Commands: HELP, NODES, BIND, BIND OFF, SETINT <nodeId> <ms>, SETINT ALL <ms>, SETSAMPLE <nodeId> <hz>, SETSAMPLE ALL <hz>, SLEEP <nodeId> ON|OFF, SLEEP ALL ON|OFF, SETTOFF <nodeId> <tempOffsetC>, HEATER <nodeId> ON|OFF, RENAME <nodeId> <name>, STREAM OFF, STREAM ON, TIME STATUS, TIME SET <unixSeconds>, OTA PREP <nodeId> ON|OFF, OTA READY <nodeId> ON|OFF, OTA BEGIN <nodeId> <size> <crc32hex>, OTA CHUNK <offset> <hex>, OTA END, OTA STATUS, OTA ABORT");
     } else if (cmd.equalsIgnoreCase("NODES")) {
         listNodes();
     } else if (cmd.equalsIgnoreCase("BIND")) {
@@ -1134,6 +1207,25 @@ void processSerialCommand(const String& raw) {
                 );
             }
         }
+    } else if (cmd.startsWith("OTA PREP ")) {
+        int sp = cmd.indexOf(' ', 9);
+        if (sp > 0) {
+            uint32_t nodeId = cmd.substring(9, sp).toInt();
+            String value = cmd.substring(sp + 1);
+            value.trim();
+            int idx = findNodeById(nodeId);
+            if (idx >= 0) {
+                if (value.equalsIgnoreCase("ON")) {
+                    setNodeOtaPrep(static_cast<size_t>(idx), true);
+                } else if (value.equalsIgnoreCase("OFF")) {
+                    setNodeOtaPrep(static_cast<size_t>(idx), false);
+                } else {
+                    printJsonEvent("{\"event\":\"ota_error\",\"reason\":\"invalid_prep_value\"}", true);
+                    printPrompt();
+                    return;
+                }
+            }
+        }
     } else if (cmd.startsWith("OTA READY ")) {
         int sp = cmd.indexOf(' ', 10);
         if (sp > 0) {
@@ -1155,10 +1247,12 @@ void processSerialCommand(const String& raw) {
         }
     } else if (cmd.equalsIgnoreCase("OTA STATUS")) {
         bool otaReady = false;
+        bool otaPrepActive = false;
         if (otaSession.nodeId != 0) {
             int idx = findNodeById(otaSession.nodeId);
             if (idx >= 0) {
-                otaReady = nodes[idx].otaReady;
+                otaReady = effectiveOtaReady(nodes[idx]);
+                otaPrepActive = nodes[idx].otaPrepActive;
             }
         }
         printJsonEvent(
@@ -1167,7 +1261,8 @@ void processSerialCommand(const String& raw) {
             ",\"node_id\":" + String(otaSession.nodeId) +
             ",\"next_offset\":" + String(otaSession.nextOffset) +
             ",\"bytes_received\":" + String(otaSession.bytesReceived) +
-            ",\"ota_ready\":" + String(otaReady ? "true" : "false") + "}"
+            ",\"ota_ready\":" + String(otaReady ? "true" : "false") +
+            ",\"ota_prep_active\":" + String(otaPrepActive ? "true" : "false") + "}"
         );
     } else if (cmd.equalsIgnoreCase("OTA ABORT")) {
         abortOta("host_request");
@@ -1180,7 +1275,7 @@ void processSerialCommand(const String& raw) {
             uint32_t expectedCrc32 = strtoul(cmd.substring(sp2 + 1).c_str(), nullptr, 16);
             if (!beginOta(nodeId, totalSize, expectedCrc32)) {
                 int idx = findNodeById(nodeId);
-                const char* reason = (idx >= 0 && !nodes[idx].otaReady) ? "target_not_ready" : "begin_rejected";
+                const char* reason = (idx >= 0 && !effectiveOtaReady(nodes[idx])) ? "target_not_ready" : "begin_rejected";
                 printJsonEvent(
                     "{\"event\":\"ota_error\",\"reason\":\"" + String(reason) + "\",\"node_id\":" + String(nodeId) + "}",
                     true

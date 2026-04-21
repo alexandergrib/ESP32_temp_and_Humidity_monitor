@@ -11,7 +11,10 @@ Desktop logger for the ESP32 temperature monitor project.
 - Exports CSV data
 - Supports per-channel naming, colors, recording enable/disable, and calibration
 - Supports marker annotations and session reload
+- Handles ESP satellite presence using the configured report interval instead of a fixed timeout
+- Smooths satellite chart data using a time window to reduce jagged 0.1 C/minute fluctuations
 - Builds into a Windows desktop app with PyInstaller
+- Shows the app version in the title bar and App info dialog
 
 ## Requirements
 
@@ -29,6 +32,22 @@ pip install -r requirements.txt
 ```bash
 python arduino_logger_v72.py
 ```
+
+`arduino_logger_v72.py` is a compatibility launcher. The app implementation is split into the `temp_humidity_logger` package:
+
+- `app.py` - main UI orchestration
+- `config_store.py` - config and runtime settings
+- `database.py` - SQLite sessions, markers, and CSV export
+- `esp_controller.py` - ESP controller and satellite presence logic
+- `serial_io.py` - serial connection, packet parsing, and polling
+- `channels.py` - channel table, legend, and editor UI
+- `layout.py` - docked/floating terminal and marker layout
+- `sessions.py` - session browser and reload UI
+- `graph_interaction.py` - graph zoom, pan, scrollbar, and markers
+- `calibration.py` - calibration logic and manager UI
+- `esp_events.py` - ESP JSON parsing helpers
+- `smoothing.py` - chart smoothing helpers
+- `version.py` - app name/version constants
 
 ## Recommended Setup
 
@@ -68,6 +87,22 @@ Packaged runtime data is stored outside the build output in:
 ```
 
 That avoids rebuilds deleting `config.ini`, `logger.db`, or exported CSV files.
+
+## Tests
+
+From the repository root:
+
+```powershell
+.\Temp_and_HumidityLogger\venv\Scripts\python.exe run_tests.py --suite fast
+```
+
+Run the full suite, including firmware builds:
+
+```powershell
+.\Temp_and_HumidityLogger\venv\Scripts\python.exe run_tests.py --suite all
+```
+
+See `..\TESTING.md` for details.
 
 ## Runtime Files
 
@@ -114,7 +149,8 @@ Close serial terminals, previous logger instances, or OTA tools using the same p
 
 ## Relevant Files
 
-- `arduino_logger_v72.py` - main application
+- `arduino_logger_v72.py` - compatibility launcher
+- `temp_humidity_logger\` - modular application package
 - `build_exe.ps1` - primary Windows packaging script
 - `TempHumidityLogger.spec` - PyInstaller spec
 - `config.ini` - local runtime configuration
