@@ -12,6 +12,15 @@ class EspHarness(EspControllerMixin):
     CHANNEL_COUNT = 8
 
     def __init__(self):
+        class Root:
+            def after(self, delay_ms, callback):
+                return ("after", delay_ms, callback)
+
+            def after_cancel(self, job):
+                pass
+
+        self.root = Root()
+        self.esp_presence_job = None
         self.esp_node_state = {}
         self.esp_slot_by_node_id = {}
         self.current_signals = ["-"] * self.CHANNEL_COUNT
@@ -77,6 +86,7 @@ class EspControllerTests(unittest.TestCase):
     def test_presence_timeout_scales_with_interval(self):
         harness = EspHarness()
         self.assertGreater(harness.esp_presence_timeout_seconds(20000), harness.esp_presence_timeout_seconds(1000))
+        self.assertGreater(harness.esp_presence_timeout_seconds(60000), 180)
 
     def test_interval_reduction_adds_grace(self):
         harness = EspHarness()
@@ -115,6 +125,24 @@ class EspControllerTests(unittest.TestCase):
         )
         self.assertTrue(any(item[0] == "db" for item in harness.saved))
         self.assertEqual(harness.redraws, 1)
+
+    def test_reading_updates_presence_schedule_for_long_interval(self):
+        harness = EspHarness()
+        with patch("temp_humidity_logger.esp_controller.time.monotonic", return_value=100.0):
+            harness.process_esp_packet_line(
+                '{"event":"reading","node_id":2,"name":"satellite","temperature_c":22.5,'
+                '"humidity_pct":40.5,"sensor_ok":true,"signal_pct":95,"rssi_dbm":-52,'
+                '"report_interval_ms":60000,"next_report_delay_ms":59000,'
+                '"controller_time":"2026-04-21T08:15:43Z"}'
+            )
+        state = harness.esp_node_state[2]
+        self.assertEqual(state["report_interval_ms"], 60000)
+        self.assertEqual(state["next_report_delay_ms"], 59000)
+
+        with patch("temp_humidity_logger.esp_controller.time.monotonic", return_value=165.0):
+            harness.check_esp_presence()
+        self.assertTrue(harness.esp_node_state[2]["online"])
+        self.assertEqual(harness.markers, [])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,118 @@
+name: Release build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-app:
+    name: Build Windows desktop app
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create app venv
+        working-directory: Temp_and_HumidityLogger
+        run: python -m venv venv
+
+      - name: Install app dependencies
+        working-directory: Temp_and_HumidityLogger
+        run: |
+          .\venv\Scripts\python.exe -m pip install --upgrade pip
+          .\venv\Scripts\python.exe -m pip install -r requirements.txt
+
+      - name: Build app
+        working-directory: Temp_and_HumidityLogger
+        run: .\build_exe.ps1 -Clean
+
+      - name: Zip app
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path Temp_and_HumidityLogger\dist\TempHumidityLogger\* `
+            -DestinationPath TempHumidityLogger-${{ github.ref_name }}-windows.zip
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-app
+          path: TempHumidityLogger-${{ github.ref_name }}-windows.zip
+          if-no-files-found: error
+
+  build-firmware:
+    name: Build ESP32 firmware
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PlatformIO
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install platformio
+
+      - name: Build controller firmware
+        run: python -m platformio run -e controller_upload
+
+      - name: Build satellite firmware
+        run: python -m platformio run -e satellite_upload
+
+      - name: Stage firmware
+        run: |
+          mkdir -p release-firmware
+          cp .pio/build/controller_upload/firmware.bin release-firmware/controller-firmware-${{ github.ref_name }}.bin
+          cp .pio/build/controller_upload/bootloader.bin release-firmware/controller-bootloader-${{ github.ref_name }}.bin
+          cp .pio/build/controller_upload/partitions.bin release-firmware/controller-partitions-${{ github.ref_name }}.bin
+          cp .pio/build/satellite_upload/firmware.bin release-firmware/satellite-firmware-${{ github.ref_name }}.bin
+          cp .pio/build/satellite_upload/bootloader.bin release-firmware/satellite-bootloader-${{ github.ref_name }}.bin
+          cp .pio/build/satellite_upload/partitions.bin release-firmware/satellite-partitions-${{ github.ref_name }}.bin
+
+      - name: Zip firmware
+        run: |
+          cd release-firmware
+          zip ../esp32-firmware-${{ github.ref_name }}.zip *.bin
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32-firmware
+          path: esp32-firmware-${{ github.ref_name }}.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub release assets
+    needs:
+      - build-windows-app
+      - build-firmware
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*

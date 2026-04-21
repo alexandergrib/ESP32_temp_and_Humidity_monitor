@@ -493,8 +493,8 @@ void sendRename(uint32_t nodeId, const String& requestedName) {
     esp_now_send(nodes[idx].mac, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
 }
 
-void sendReadingAck(size_t idx, uint32_t readingSequence) {
-    if (idx >= MAX_NODES || !nodes[idx].used) return;
+uint32_t sendReadingAck(size_t idx, uint32_t readingSequence) {
+    if (idx >= MAX_NODES || !nodes[idx].used) return MIN_REPORT_SLOT_GAP_MS;
     ReadingAck ack{};
     fillHeader(ack.header, MSG_READING_ACK, txSeq++, nodes[idx].nodeId, millis());
     ack.readingSequence = readingSequence;
@@ -509,6 +509,7 @@ void sendReadingAck(size_t idx, uint32_t readingSequence) {
     ack.sampleRateHz = normalizeSampleRateHz(nodes[idx].sampleRateHz);
     ensurePeer(nodes[idx].mac);
     esp_now_send(nodes[idx].mac, reinterpret_cast<const uint8_t*>(&ack), sizeof(ack));
+    return ack.nextReportDelayMs;
 }
 
 void armOtaAckWait(OtaPhase phase, uint32_t offset = 0, uint16_t len = 0, const uint8_t* data = nullptr) {
@@ -745,7 +746,7 @@ void handleReading(const uint8_t* mac, const Reading& msg, int8_t rssiDbm) {
     nodes[idx].fwMinor = msg.reserved[1];
     nodes[idx].lastRssiDbm = rssiDbm;
     nodes[idx].lastDeliveredReadingSeq = msg.header.sequence;
-    sendReadingAck(static_cast<size_t>(idx), msg.header.sequence);
+    const uint32_t nextReportDelayMs = sendReadingAck(static_cast<size_t>(idx), msg.header.sequence);
 
     printJsonEvent(
         "{\"event\":\"reading\",\"node_id\":" + String(nodes[idx].nodeId) +
@@ -753,6 +754,8 @@ void handleReading(const uint8_t* mac, const Reading& msg, int8_t rssiDbm) {
         "\",\"temperature_c\":" + String(msg.temperatureC, 2) +
         ",\"humidity_pct\":" + String(msg.humidityPct, 2) +
         ",\"sensor_ok\":" + String(msg.sensorOk ? "true" : "false") +
+        ",\"report_interval_ms\":" + String(effectiveReportIntervalMs(nodes[idx])) +
+        ",\"next_report_delay_ms\":" + String(nextReportDelayMs) +
         ",\"fw_version\":\"" + String(nodes[idx].fwMajor) + "." + String(nodes[idx].fwMinor) + "\"" +
         ",\"rssi_dbm\":" + String(nodes[idx].lastRssiDbm) +
         ",\"signal_pct\":" + String(rssiToSignalPercent(nodes[idx].lastRssiDbm)) +

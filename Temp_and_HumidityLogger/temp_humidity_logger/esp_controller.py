@@ -76,12 +76,30 @@ class EspControllerMixin:
             "report_interval_ms": self.default_esp_report_interval_ms(),
             "signal_pct": None,
             "rssi_dbm": None,
+            "next_report_delay_ms": 0,
+            "schedule_seen_monotonic": 0.0,
             "has_announced_online": False,
             "presence_grace_until_monotonic": 0.0,
         }
         for key, value in defaults.items():
             state.setdefault(key, value)
         return state
+
+
+    def update_esp_node_schedule_from_event(self, state, event, now_monotonic=None):
+        if now_monotonic is None:
+            now_monotonic = time.monotonic()
+        try:
+            if event.get("report_interval_ms") is not None:
+                state["report_interval_ms"] = max(250, int(event.get("report_interval_ms")))
+        except Exception:
+            pass
+        try:
+            if event.get("next_report_delay_ms") is not None:
+                state["next_report_delay_ms"] = max(0, int(event.get("next_report_delay_ms")))
+                state["schedule_seen_monotonic"] = now_monotonic
+        except Exception:
+            pass
 
 
     def update_esp_node_presence(self, node_id, online, dt=None):
@@ -145,6 +163,19 @@ class EspControllerMixin:
                     report_interval_ms = self.default_esp_report_interval_ms()
                 stale_after_s = self.esp_presence_timeout_seconds(report_interval_ms)
                 last_seen = float(state.get("last_seen_monotonic") or 0.0)
+                next_report_delay_ms = 0
+                try:
+                    next_report_delay_ms = max(0, int(state.get("next_report_delay_ms") or 0))
+                except Exception:
+                    next_report_delay_ms = 0
+                schedule_seen = float(state.get("schedule_seen_monotonic") or 0.0)
+                if next_report_delay_ms > 0 and schedule_seen > 0.0:
+                    scheduled_timeout_s = (
+                        (schedule_seen - last_seen)
+                        + (next_report_delay_ms / 1000.0)
+                        + self.esp_presence_timeout_seconds(max(report_interval_ms, next_report_delay_ms))
+                    )
+                    stale_after_s = max(stale_after_s, scheduled_timeout_s)
                 grace_until = float(state.get("presence_grace_until_monotonic") or 0.0)
                 if grace_until > now_monotonic:
                     continue
@@ -268,7 +299,9 @@ class EspControllerMixin:
             state["signal_pct"] = signal_pct
             state["rssi_dbm"] = rssi_dbm
             now = self.parse_esp_timestamp(event)
-            state["last_seen_monotonic"] = time.monotonic()
+            now_monotonic = time.monotonic()
+            self.update_esp_node_schedule_from_event(state, event, now_monotonic=now_monotonic)
+            state["last_seen_monotonic"] = now_monotonic
             state["last_seen_dt"] = now
             self.update_esp_node_presence(node_id, True, dt=now)
             sensor_ok = bool(event.get("sensor_ok", True))
@@ -306,16 +339,14 @@ class EspControllerMixin:
             except Exception:
                 return
             state = self.ensure_esp_node_state(node_id)
-            try:
-                state["report_interval_ms"] = max(250, int(event.get("report_interval_ms")))
-            except Exception:
-                pass
+            now_monotonic = time.monotonic()
+            self.update_esp_node_schedule_from_event(state, event, now_monotonic=now_monotonic)
             try:
                 state["sleep_enabled"] = bool(event.get("sleep_enabled"))
             except Exception:
                 pass
             now = self.parse_esp_timestamp(event)
-            state["last_seen_monotonic"] = time.monotonic()
+            state["last_seen_monotonic"] = now_monotonic
             state["last_seen_dt"] = now
             self.update_esp_node_presence(node_id, True, dt=now)
         elif event_name == "rename_ack":
@@ -372,10 +403,9 @@ class EspControllerMixin:
                 state["rssi_dbm"] = rssi_dbm
                 if not state.get("online") and not float(state.get("last_seen_monotonic") or 0.0):
                     self.current_signals[slot_idx] = "waiting"
-                try:
-                    state["report_interval_ms"] = max(250, int(item.get("report_interval_ms")))
-                except Exception:
-                    state["report_interval_ms"] = state.get("report_interval_ms") or self.default_esp_report_interval_ms()
+                self.update_esp_node_schedule_from_event(state, item)
+                if not state.get("report_interval_ms"):
+                    state["report_interval_ms"] = self.default_esp_report_interval_ms()
                 try:
                     state["sleep_enabled"] = bool(item.get("sleep_enabled"))
                 except Exception:

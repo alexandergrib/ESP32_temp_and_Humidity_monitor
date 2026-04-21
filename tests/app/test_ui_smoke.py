@@ -6,6 +6,24 @@ from tests.support.path_setup import LOGGER_ROOT  # noqa: F401
 
 
 class UiSmokeTests(unittest.TestCase):
+    def test_main_module_calls_main_when_executed(self):
+        import runpy
+        import sys
+        import types
+        from unittest import mock
+
+        fake_app_module = types.ModuleType("temp_humidity_logger.app")
+        fake_app_module.ArduinoLoggerApp = mock.Mock()
+
+        with mock.patch.dict(sys.modules, {"temp_humidity_logger.app": fake_app_module}), mock.patch("tkinter.Tk") as tk_mock:
+            root = tk_mock.return_value
+            runpy.run_module("temp_humidity_logger.main", run_name="__main__")
+
+        tk_mock.assert_called_once_with()
+        fake_app_module.ArduinoLoggerApp.assert_called_once_with(root)
+        root.protocol.assert_called_once()
+        root.mainloop.assert_called_once_with()
+
     def test_app_info_includes_github_url(self):
         from temp_humidity_logger.settings_ui import SettingsUiMixin
         from temp_humidity_logger import version
