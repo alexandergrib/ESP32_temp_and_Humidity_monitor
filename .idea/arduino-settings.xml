@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<project version="4">
-  <component name="ArduinoSettingsState">
-    <option name="espIdfPath" value="$PROJECT_DIR$/../../../../../Espressif/frameworks/esp-idf-v5.3.2" />
-    <option name="pythonPath" value="C:\Users\LENOVO\.espressif\python_env\idf5.3_py3.14_env\Scripts\python.exe" />
-    <option name="activeBackend" value="arduino-cli" />
-  </component>
-</project>

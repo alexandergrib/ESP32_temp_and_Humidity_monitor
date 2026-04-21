@@ -9,9 +9,10 @@ class SettingsUiMixin:
     def show_app_info(self):
         messagebox.showinfo(
             "App Info",
-            "{0}\nVersion: {1}\n\nLogs data:\n{2}".format(
+            "{0}\nVersion: {1}\n\nGitHub:\n{2}\n\nLogs data:\n{3}".format(
                 self.APP_NAME,
                 self.APP_VERSION,
+                self.GITHUB_URL,
                 # self.install_dir,
                 self.base_dir,
             ),

@@ -25,6 +25,7 @@ from .serial_io import SerialIoMixin
 from .settings_ui import SettingsUiMixin
 from .sessions import SessionUiMixin
 from .version import APP_DATA_DIR_NAME as PACKAGE_APP_DATA_DIR_NAME
+from .version import GITHUB_URL as PACKAGE_GITHUB_URL
 from .version import APP_NAME as PACKAGE_APP_NAME
 from .version import APP_VERSION as PACKAGE_APP_VERSION
 
@@ -35,6 +36,7 @@ class ArduinoLoggerApp(
 ):
     APP_NAME = PACKAGE_APP_NAME
     APP_VERSION = PACKAGE_APP_VERSION
+    GITHUB_URL = PACKAGE_GITHUB_URL
     ARDUINO_CHANNEL_COUNT = 6
     ESP_CHANNEL_COUNT = 8
     CHANNEL_COUNT = ARDUINO_CHANNEL_COUNT + ESP_CHANNEL_COUNT
