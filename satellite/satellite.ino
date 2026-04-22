@@ -48,6 +48,8 @@ static constexpr float SENSOR_MAX_VALID_HUMIDITY_PCT = 100.0f;
 static constexpr uint8_t SENSOR_AVERAGING_WINDOW_PERCENT = 20;
 static constexpr uint32_t SENSOR_AVERAGING_WINDOW_MIN_MS = 1000;
 static constexpr uint32_t SENSOR_WAKE_MARGIN_MS = 500;
+static constexpr uint32_t SENSOR_FAILED_CAPTURE_RETRY_MS = 1000;
+static constexpr uint8_t SENSOR_FAILED_CAPTURE_HEARTBEAT_THRESHOLD = 3;
 static constexpr uint32_t READING_ACK_TIMEOUT_MS = 250;
 static constexpr uint32_t READING_RETRY_BACKOFF_MS = 150;
 static constexpr uint32_t READING_ACK_RECOVERY_RETRY_MS = 1000;
@@ -91,6 +93,7 @@ uint32_t lastControllerContactAtMs = 0;
 uint32_t lastRecoveryBindAttemptAtMs = 0;
 bool pendingSettingsSync = false;
 uint32_t lastSettingsSyncRequestAtMs = 0;
+uint8_t consecutiveFailedCaptures = 0;
 
 struct SatelliteOtaState {
     bool active = false;
@@ -159,6 +162,7 @@ void applyControllerState(
 void beginCaptureWindow();
 void completeCaptureWindow();
 bool captureScheduledReading();
+void dropBufferedSensorFailureReadings();
 void saveConfig();
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
 void onDataRecv(const esp_now_recv_info_t*, const uint8_t* data, int len);
@@ -500,6 +504,16 @@ void dropOldestBufferedReading() {
     readingBufferCount--;
 }
 
+void dropBufferedSensorFailureReadings() {
+    while (readingBufferCount > 0) {
+        const BufferedReading& item = readingBuffer[readingBufferHead];
+        if (item.sensorOk != 0) {
+            return;
+        }
+        dropOldestBufferedReading();
+    }
+}
+
 bool enqueueBufferedReading(float temperatureC, float humidityPct, bool sensorOk) {
     if (readingBufferCount >= READING_BUFFER_CAPACITY) {
         return false;
@@ -569,15 +583,26 @@ void beginCaptureWindow() {
     captureWindowActive = true;
     captureWindowEndsAtMs = millis() + captureWindowMs();
     restartSensorSampler(true);
+    dropBufferedSensorFailureReadings();
     stayAwakeForController(captureWindowMs() + READING_ACK_TIMEOUT_MS + READING_RETRY_BACKOFF_MS);
 }
 
 void completeCaptureWindow() {
     captureWindowActive = false;
     captureWindowEndsAtMs = 0;
-    captureScheduledReading();
-    scheduleNextReport(normalizeReportInterval(reportIntervalMs));
-    stayAwakeForController(READING_ACK_TIMEOUT_MS + READING_RETRY_BACKOFF_MS + 500);
+    const bool queuedReading = captureScheduledReading();
+    if (queuedReading) {
+        scheduleNextReport(normalizeReportInterval(reportIntervalMs));
+        stayAwakeForController(READING_ACK_TIMEOUT_MS + READING_RETRY_BACKOFF_MS + 500);
+    } else {
+        scheduleNextReport(SENSOR_FAILED_CAPTURE_RETRY_MS);
+        stayAwakeForController(
+            SENSOR_FAILED_CAPTURE_RETRY_MS +
+            captureWindowMs() +
+            READING_ACK_TIMEOUT_MS +
+            READING_RETRY_BACKOFF_MS
+        );
+    }
 }
 
 bool captureScheduledReading() {
@@ -586,7 +611,16 @@ bool captureScheduledReading() {
     bool sensorOk = false;
     prepareReadingSnapshot(temperatureC, humidityPct, sensorOk);
     if (!sensorOk) {
-        Serial.println("Sensor read failed: sending heartbeat without measurement");
+        consecutiveFailedCaptures = min<uint8_t>(consecutiveFailedCaptures + 1, 255);
+        if (consecutiveFailedCaptures < SENSOR_FAILED_CAPTURE_HEARTBEAT_THRESHOLD) {
+            Serial.println("Sensor read failed: retrying before reporting heartbeat");
+            return false;
+        }
+        Serial.println("Sensor read failed repeatedly: sending heartbeat without measurement");
+        consecutiveFailedCaptures = 0;
+    } else {
+        consecutiveFailedCaptures = 0;
+        dropBufferedSensorFailureReadings();
     }
     if (!enqueueBufferedReading(temperatureC, humidityPct, sensorOk)) {
         Serial.println("Reading buffer full, keeping oldest unsent data");
@@ -1028,11 +1062,11 @@ void maintainControllerLink() {
 
     const uint32_t nowMs = millis();
     const uint32_t staleAfterMs = max<uint32_t>(15000, normalizeReportInterval(reportIntervalMs) * 3U);
-    if (!timeReachedMs(nowMs, lastControllerContactAtMs + staleAfterMs)) {
+    if (lastControllerContactAtMs != 0 && !timeReachedMs(nowMs, lastControllerContactAtMs + staleAfterMs)) {
         return;
     }
 
-    stayAwakeForController();
+    stayAwakeForController(CONTROLLER_AWAKE_WINDOW_MS);
     if (!timeReachedMs(nowMs, lastRecoveryBindAttemptAtMs + 3000)) {
         return;
     }
@@ -1202,9 +1236,11 @@ void setup() {
     if (isBound) {
         ensurePeer(controllerMac);
         scheduleNextReport(reportIntervalMs);
-        stayAwakeForController();
-        lastControllerContactAtMs = millis();
+        stayAwakeForController(CONTROLLER_AWAKE_WINDOW_MS);
+        lastControllerContactAtMs = 0;
         lastRecoveryBindAttemptAtMs = 0;
+        pendingSettingsSync = true;
+        lastSettingsSyncRequestAtMs = 0;
         Serial.printf(
             "Loaded binding: node %lu controller %s fw %u.%u\n",
             static_cast<unsigned long>(nodeId),

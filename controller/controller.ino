@@ -360,7 +360,7 @@ void printNodePresenceEvent(const NodeRecord& node, bool online, uint32_t nowMs)
 void markNodeSeen(size_t idx, uint32_t nowMs) {
     if (idx >= MAX_NODES || !nodes[idx].used) return;
     const bool wasOnline = nodes[idx].online;
-    markNodeSeen(static_cast<size_t>(idx), nowMs);
+    nodes[idx].lastSeenMs = nowMs;
     nodes[idx].online = true;
     if (!wasOnline) {
         printNodePresenceEvent(nodes[idx], true, nowMs);

@@ -71,7 +71,11 @@ class FirmwareStaticContractTests(unittest.TestCase):
         self.assertIn("max<uint32_t>(SENSOR_AVERAGING_WINDOW_MIN_MS, scaledWindowMs)", satellite)
         self.assertIn("SENSOR_WAKE_MARGIN_MS + sensorAveragingWindowMs()", satellite)
         self.assertIn("if (!sensorOk)", satellite)
-        self.assertIn("Sensor read failed: sending heartbeat without measurement", satellite)
+        self.assertIn("SENSOR_FAILED_CAPTURE_RETRY_MS = 1000", satellite)
+        self.assertIn("SENSOR_FAILED_CAPTURE_HEARTBEAT_THRESHOLD = 3", satellite)
+        self.assertIn("Sensor read failed: retrying before reporting heartbeat", satellite)
+        self.assertIn("Sensor read failed repeatedly: sending heartbeat without measurement", satellite)
+        self.assertIn("dropBufferedSensorFailureReadings();", satellite)
         self.assertIn("enqueueBufferedReading(temperatureC, humidityPct, sensorOk)", satellite)
 
     def test_satellite_stays_awake_until_reading_ack(self):
@@ -84,6 +88,14 @@ class FirmwareStaticContractTests(unittest.TestCase):
             satellite,
             re.compile(r"if \(BufferedReading\* pending = oldestBufferedReading\(\)\).*?return;", re.DOTALL),
         )
+
+    def test_bound_satellite_rebinds_until_controller_contact_confirmed(self):
+        satellite = self.read("satellite/satellite.ino")
+
+        self.assertIn("lastControllerContactAtMs = 0;", satellite)
+        self.assertIn("pendingSettingsSync = true;", satellite)
+        self.assertIn("lastControllerContactAtMs != 0", satellite)
+        self.assertIn("stayAwakeForController(CONTROLLER_AWAKE_WINDOW_MS);", satellite)
 
     def test_sleep_mode_requires_long_report_interval(self):
         shared_protocol = self.read("shared/protocol.h")
