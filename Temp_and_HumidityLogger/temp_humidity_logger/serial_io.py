@@ -619,7 +619,9 @@ class SerialIoMixin:
                 self.end_db_session()
                 self.append_session_to_data_csv(finished_session_id)
                 self.last_session_id = finished_session_id
+                self.loaded_session_id = finished_session_id
                 self.db_session_id = None
+                self.refresh_graph_titles()
             self.refresh_sessions_list()
         self.update_status_label()
         self.update_sessions_controls()
