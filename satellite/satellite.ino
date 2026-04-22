@@ -29,9 +29,11 @@ static constexpr uint32_t STATUS_LED_ON_MS = 80;
 static constexpr uint32_t STATUS_LED_UNBOUND_PERIOD_MS = 1800;
 static constexpr uint32_t STATUS_LED_OTA_PERIOD_MS = 160;
 static constexpr uint32_t STATUS_LED_ACTIVITY_MS = 140;
+static constexpr bool SHT85_FAST_LOW_REPEATABILITY_MODE = false;
+static constexpr bool SHT85_SKIP_CRC_CHECK = false;
 static constexpr uint32_t SENSOR_CHUNK_US = 10000;
-static constexpr uint32_t SENSOR_MIN_SAMPLE_PERIOD_US = 6000;
-static constexpr uint32_t SENSOR_MAX_SAMPLE_PERIOD_US = 12000;
+static constexpr uint32_t SENSOR_MIN_SAMPLE_PERIOD_US = 200000;
+static constexpr uint32_t SENSOR_ADAPTIVE_BACKOFF_MAX_PERIOD_US = 500000;
 static constexpr uint32_t SENSOR_MIN_SETTLE_US = 5500;
 static constexpr uint32_t SENSOR_RETRY_INTERVAL_US = 250000;
 static constexpr uint32_t SENSOR_REQUEST_TIMEOUT_US = 50000;
@@ -270,11 +272,7 @@ uint32_t requestedSamplePeriodUs() {
 }
 
 uint32_t samplePeriodUs() {
-    return constrain(
-        max(sensorSampler.effectiveSamplePeriodUs, requestedSamplePeriodUs()),
-        requestedSamplePeriodUs(),
-        SENSOR_MAX_SAMPLE_PERIOD_US
-    );
+    return max(sensorSampler.effectiveSamplePeriodUs, requestedSamplePeriodUs());
 }
 
 bool isValidSensorSample(float temperatureC, float humidityPct) {
@@ -388,8 +386,12 @@ void noteSamplingFailure() {
     sensorSampler.consecutiveGoodSamples = 0;
     const uint32_t backoffStepUs = SENSOR_ADAPTIVE_BACKOFF_STEP_US *
                                    min<uint8_t>(sensorSampler.consecutiveBadSamples, 4);
+    const uint32_t maxBackoffPeriodUs = max(
+        requestedSamplePeriodUs(),
+        SENSOR_ADAPTIVE_BACKOFF_MAX_PERIOD_US
+    );
     sensorSampler.effectiveSamplePeriodUs = min(
-        SENSOR_MAX_SAMPLE_PERIOD_US,
+        maxBackoffPeriodUs,
         max(sensorSampler.effectiveSamplePeriodUs, requestedSamplePeriodUs()) + backoffStepUs
     );
 }
@@ -749,8 +751,9 @@ void pumpSensorSampling() {
     if (otaState.active) return;
 
     if (sensorSampler.requestInFlight) {
-        if (timeReachedUs(nowUs, sensorSampler.requestIssuedAtUs + SENSOR_MIN_SETTLE_US) && sht.dataReady(true)) {
-            sensorPresent = sht.readData(false);
+        if (timeReachedUs(nowUs, sensorSampler.requestIssuedAtUs + SENSOR_MIN_SETTLE_US) &&
+            sht.dataReady(SHT85_FAST_LOW_REPEATABILITY_MODE)) {
+            sensorPresent = sht.readData(SHT85_SKIP_CRC_CHECK);
             if (sensorPresent) {
                 const float temperatureC = sht.getTemperature();
                 const float humidityPct = sht.getHumidity();
@@ -777,7 +780,7 @@ void pumpSensorSampling() {
 
     if (!timeReachedUs(nowUs, sensorSampler.nextRequestAtUs)) return;
 
-    if (sht.requestData(true)) {
+    if (sht.requestData(SHT85_FAST_LOW_REPEATABILITY_MODE)) {
         sensorSampler.requestInFlight = true;
         sensorSampler.requestIssuedAtUs = nowUs;
     } else {

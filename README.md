@@ -254,8 +254,8 @@ Available controller commands:
 - `STREAM OFF` disable streaming output
 - `SETINT <nodeId> <ms>` set one node report interval in milliseconds
 - `SETINT ALL <ms>` set the report interval for every known node
-- `SETSAMPLE <nodeId> <hz>` set one node sample rate in Hz
-- `SETSAMPLE ALL <hz>` set the sample rate for every known node
+- `SETSAMPLE <nodeId> <hz>` set one node sample rate in Hz (`1` to `5`)
+- `SETSAMPLE ALL <hz>` set the sample rate for every known node (`1` to `5`)
 - `SLEEP <nodeId> ON|OFF` enable or disable light sleep for one node
 - `SLEEP ALL ON|OFF` enable or disable light sleep for every known node
 - `SETTOFF <nodeId> <tempOffsetC>` store and apply a temperature offset
@@ -276,7 +276,8 @@ Available controller commands:
 
 - Controller stream is off by default at boot
 - Controller polls satellites and spaces polls automatically when multiple satellites are present
-- Satellites sample SHT85 continuously at a configurable target rate up to `200 Hz`
+- Satellites sample SHT85 during each capture window at a configurable target rate up to `5 Hz`
+- SHT85 sampling uses high-repeatability single-shot mode with CRC-validated readout
 - Poll responses are averaged from stored `10 ms` sample chunks
 - Satellite firmware version is reported to the controller
 - RSSI is reported as both `rssi_dbm` and `signal_pct`

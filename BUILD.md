@@ -186,8 +186,8 @@ Available controller commands:
 - `STREAM OFF` disable streaming output
 - `SETINT <nodeId> <ms>` set one node report interval in milliseconds
 - `SETINT ALL <ms>` set the report interval for every known node
-- `SETSAMPLE <nodeId> <hz>` set one node sample rate in Hz
-- `SETSAMPLE ALL <hz>` set the sample rate for every known node
+- `SETSAMPLE <nodeId> <hz>` set one node sample rate in Hz (`1` to `5`)
+- `SETSAMPLE ALL <hz>` set the sample rate for every known node (`1` to `5`)
 - `SLEEP <nodeId> ON|OFF` enable or disable light sleep for one node
 - `SLEEP ALL ON|OFF` enable or disable light sleep for every known node
 - `SETTOFF <nodeId> <tempOffsetC>` store and apply a temperature offset
