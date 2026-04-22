@@ -77,6 +77,7 @@ class UiSmokeTests(unittest.TestCase):
 
         self.assertIn('label="Open logs folder..."', source)
         self.assertIn('label="Satellite sleep mode ALL on/off"', source)
+        self.assertIn('label="Save terminal output to file"', source)
 
     def test_minor_grid_has_visible_style(self):
         source = (LOGGER_ROOT / "temp_humidity_logger" / "graph_interaction.py").read_text(encoding="utf-8")

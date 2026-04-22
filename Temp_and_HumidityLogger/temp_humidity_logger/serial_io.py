@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import queue
 import re
 import threading
@@ -650,9 +651,50 @@ class SerialIoMixin:
             return int(m.group(1)) * 3600000
         return None
 
+    def terminal_output_log_path(self):
+        return os.path.join(self.base_dir, "terminal_output.log")
+
+    def write_terminal_output_log(self, text, auto_newline=True):
+        if not getattr(self, "terminal_output_logging_enabled", False):
+            return
+        if not text:
+            return
+        try:
+            os.makedirs(self.base_dir, exist_ok=True)
+            with open(self.terminal_output_log_path(), "a", encoding="utf-8") as fh:
+                fh.write(str(text))
+                if auto_newline and not str(text).endswith("\n"):
+                    fh.write("\n")
+        except Exception as ex:
+            self.terminal_output_logging_enabled = False
+            if hasattr(self, "terminal_output_logging_var"):
+                try:
+                    self.terminal_output_logging_var.set(False)
+                except Exception:
+                    pass
+            if not getattr(self, "terminal_output_log_error_reported", False):
+                self.terminal_output_log_error_reported = True
+                try:
+                    self._append_to_console_widget(
+                        self.txt_console,
+                        "Terminal output log disabled: {0}".format(ex),
+                    )
+                except Exception:
+                    pass
+
+    def on_terminal_output_logging_toggle(self):
+        self.terminal_output_logging_enabled = bool(self.terminal_output_logging_var.get())
+        self.terminal_output_log_error_reported = False
+        if self.terminal_output_logging_enabled:
+            self.append_console(">>> Terminal output logging enabled: {0}".format(self.terminal_output_log_path()))
+        else:
+            self.append_console(">>> Terminal output logging disabled")
+        self.save_config()
+
     def append_console(self, text, auto_newline=True):
         if not text:
             return
+        self.write_terminal_output_log(text, auto_newline=auto_newline)
         self._append_to_console_widget(self.txt_console, text, auto_newline=auto_newline)
         if self.floating_console_text is not None:
             self._append_to_console_widget(self.floating_console_text, text, auto_newline=auto_newline)

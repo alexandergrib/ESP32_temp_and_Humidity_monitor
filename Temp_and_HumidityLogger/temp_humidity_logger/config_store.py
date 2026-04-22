@@ -190,6 +190,8 @@ class ConfigMixin:
             self.markers_visible = markers_visible_text in ("1", "true", "yes", "on")
             markers_floating_text = cfg.get("app", "markers_floating", fallback="0").strip().lower()
             self.markers_floating = markers_floating_text in ("1", "true", "yes", "on")
+            terminal_log_text = cfg.get("app", "terminal_output_logging_enabled", fallback="0").strip().lower()
+            self.terminal_output_logging_enabled = terminal_log_text in ("1", "true", "yes", "on")
             terminal_mode = cfg.get("app", "terminal_mode", fallback="").strip().lower()
             terminal_visible_text = cfg.get("app", "terminal_visible", fallback="1").strip().lower()
             if terminal_mode in ("docked", "hidden", "floating"):
@@ -271,6 +273,7 @@ class ConfigMixin:
             "minor_grid_enabled": "1" if self.minor_grid_enabled else "0",
             "markers_visible": "1" if self.markers_visible else "0",
             "markers_floating": "1" if self.markers_floating else "0",
+            "terminal_output_logging_enabled": "1" if self.terminal_output_logging_enabled else "0",
             "terminal_mode": self.terminal_mode,
             "terminal_visible": "1" if self.terminal_visible else "0",
         }

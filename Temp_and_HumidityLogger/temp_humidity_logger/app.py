@@ -88,6 +88,8 @@ class ArduinoLoggerApp(
         self.minor_grid_enabled = True
         self.markers_visible = True
         self.markers_floating = False
+        self.terminal_output_logging_enabled = False
+        self.terminal_output_log_error_reported = False
         self.terminal_mode = "docked"
         self.terminal_visible = True
         self.terminal_window = None
@@ -709,6 +711,12 @@ class ArduinoLoggerApp(
             label="Undock terminal",
             variable=self.terminal_floating_var,
             command=self.on_terminal_floating_toggle
+        )
+        self.terminal_output_logging_var = tk.BooleanVar(value=self.terminal_output_logging_enabled)
+        settings_menu.add_checkbutton(
+            label="Save terminal output to file",
+            variable=self.terminal_output_logging_var,
+            command=self.on_terminal_output_logging_toggle
         )
         self.sleep_all_var = tk.BooleanVar(value=False)
         settings_menu.add_checkbutton(
