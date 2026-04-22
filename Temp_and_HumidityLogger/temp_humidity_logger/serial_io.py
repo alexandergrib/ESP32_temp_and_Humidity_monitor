@@ -95,6 +95,8 @@ class SerialIoMixin:
             self.esp_init_attempts_remaining = 6
             self.esp_stream_confirmed = False
             self.esp_time_synced = False
+            self.last_esp_event_monotonic = time.monotonic()
+            self.last_esp_stream_recover_at = 0.0
             self.btn_connect_esp.config(text="Stop ESP")
             self.append_console(">>> ESP controller connected on {0} (session #{1})".format(port_name, self.db_session_id))
 

@@ -10,6 +10,7 @@ from .esp_events import parse_esp_event_json
 
 class EspControllerMixin:
     MIN_SLEEP_INTERVAL_MS = 30000
+    ESP_STREAM_RECOVERY_COOLDOWN_SECONDS = 30.0
 
     def sleep_enable_interval_ok(self):
         try:
@@ -161,7 +162,42 @@ class EspControllerMixin:
 
     def check_esp_presence(self):
         self.esp_presence_job = None
+        self.recover_esp_stream_if_stale()
         self.schedule_esp_presence_check()
+
+
+    def esp_stream_watchdog_timeout_seconds(self):
+        expected_gaps = []
+        for state in self.esp_node_state.values():
+            if state.get("slot_idx") is None:
+                continue
+            expected_gaps.append(self.esp_expected_reading_gap_seconds(state.get("report_interval_ms")))
+        if expected_gaps:
+            return max(30.0, min(expected_gaps) + 15.0)
+        return max(30.0, self.esp_expected_reading_gap_seconds(self.default_esp_report_interval_ms()) + 15.0)
+
+
+    def recover_esp_stream_if_stale(self):
+        if not self.source_connected.get("esp"):
+            return False
+        if not self.esp_stream_confirmed:
+            return False
+        last_event_at = float(getattr(self, "last_esp_event_monotonic", 0.0) or 0.0)
+        if last_event_at <= 0.0:
+            return False
+        now = time.monotonic()
+        if (now - last_event_at) < self.esp_stream_watchdog_timeout_seconds():
+            return False
+        last_recover_at = float(getattr(self, "last_esp_stream_recover_at", 0.0) or 0.0)
+        if (now - last_recover_at) < self.ESP_STREAM_RECOVERY_COOLDOWN_SECONDS:
+            return False
+        self.last_esp_stream_recover_at = now
+        sent_stream = self.send_esp_command("STREAM ON")
+        sent_nodes = self.send_esp_command("NODES")
+        if sent_stream or sent_nodes:
+            self.append_console(">>> [ESP] stream watchdog: STREAM ON / NODES")
+            return True
+        return False
 
 
     def apply_esp_interval(self, interval_ms, log_to_console=True):
@@ -291,7 +327,14 @@ class EspControllerMixin:
         if event is None:
             return
         event_name = str(event.get("event", "") or "")
+        self.last_esp_event_monotonic = time.monotonic()
         if event_name == "controller_ready":
+            self.esp_stream_confirmed = False
+            self.esp_time_synced = False
+            self.schedule_esp_init(200)
+            return
+        if event_name == "stream":
+            self.esp_stream_confirmed = bool(event.get("enabled"))
             if not self.esp_stream_confirmed:
                 self.schedule_esp_init(200)
             return

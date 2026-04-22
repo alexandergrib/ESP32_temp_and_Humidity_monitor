@@ -78,6 +78,14 @@ class UiSmokeTests(unittest.TestCase):
         self.assertIn('label="Open logs folder..."', source)
         self.assertIn('label="Satellite sleep mode ALL on/off"', source)
 
+    def test_minor_grid_has_visible_style(self):
+        source = (LOGGER_ROOT / "temp_humidity_logger" / "graph_interaction.py").read_text(encoding="utf-8")
+
+        self.assertIn('ax.grid(True, which="minor"', source)
+        self.assertIn('color="#cfcfcf"', source)
+        self.assertIn('linestyle="--"', source)
+        self.assertIn("alpha=0.9", source)
+
     def test_windows_build_uses_app_icon(self):
         build_script = (LOGGER_ROOT / "build_exe.ps1").read_text(encoding="utf-8")
         spec = (LOGGER_ROOT / "TempHumidityLogger.spec").read_text(encoding="utf-8")

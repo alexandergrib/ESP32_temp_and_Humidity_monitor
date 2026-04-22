@@ -140,7 +140,7 @@ class GraphInteractionMixin:
                 ax.yaxis.set_minor_locator(AutoMinorLocator(2))
                 ax.xaxis.set_minor_locator(mdates.AutoDateLocator(minticks=12, maxticks=36))
                 ax.xaxis.set_minor_formatter(NullFormatter())
-                ax.grid(True, which="minor", color="#ededed", linestyle=":", linewidth=0.6)
+                ax.grid(True, which="minor", color="#cfcfcf", linestyle="--", linewidth=0.55, alpha=0.9)
             else:
                 ax.yaxis.set_minor_locator(NullLocator())
                 ax.xaxis.set_minor_locator(NullLocator())

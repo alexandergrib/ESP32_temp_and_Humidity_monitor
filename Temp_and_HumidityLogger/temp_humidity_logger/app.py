@@ -116,6 +116,8 @@ class ArduinoLoggerApp(
         self.esp_stream_confirmed = False
         self.esp_time_synced = False
         self.esp_presence_job = None
+        self.last_esp_event_monotonic = 0.0
+        self.last_esp_stream_recover_at = 0.0
 
         self.current_temps = ["NaN"] * self.CHANNEL_COUNT
         self.current_hums = ["NaN"] * self.CHANNEL_COUNT

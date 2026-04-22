@@ -33,6 +33,9 @@ class EspHarness(EspControllerMixin):
         self.esp_stream_confirmed = False
         self.esp_time_synced = True
         self.esp_init_job = None
+        self.last_esp_event_monotonic = 0.0
+        self.last_esp_stream_recover_at = 0.0
+        self.scheduled_esp_init_delays = []
         self.markers = []
         self.saved = []
         self.row_updates = []
@@ -87,6 +90,9 @@ class EspHarness(EspControllerMixin):
     def send_esp_command(self, command):
         self.saved.append(("cmd", command))
         return True
+
+    def schedule_esp_init(self, delay_ms):
+        self.scheduled_esp_init_delays.append(delay_ms)
 
 
 class BoolVarStub:
@@ -305,6 +311,32 @@ class EspControllerTests(unittest.TestCase):
             harness.check_esp_presence()
         self.assertTrue(harness.esp_node_state[2]["online"])
         self.assertEqual(harness.markers, [])
+
+    def test_controller_ready_restarts_stream_initialization_after_reset(self):
+        harness = EspHarness()
+        harness.esp_stream_confirmed = True
+        harness.esp_time_synced = True
+
+        harness.process_esp_packet_line('{"event":"controller_ready","channel":6}')
+
+        self.assertFalse(harness.esp_stream_confirmed)
+        self.assertFalse(harness.esp_time_synced)
+        self.assertEqual(harness.scheduled_esp_init_delays, [200])
+
+    def test_stream_watchdog_reenables_stream_after_quiet_period(self):
+        harness = EspHarness()
+        harness.esp_stream_confirmed = True
+        harness.last_esp_event_monotonic = 100.0
+        state = harness.ensure_esp_node_state(2)
+        state["slot_idx"] = harness.ARDUINO_CHANNEL_COUNT
+        state["report_interval_ms"] = 30000
+
+        with patch("temp_humidity_logger.esp_controller.time.monotonic", return_value=200.0):
+            self.assertTrue(harness.recover_esp_stream_if_stale())
+
+        self.assertIn(("cmd", "STREAM ON"), harness.saved)
+        self.assertIn(("cmd", "NODES"), harness.saved)
+        self.assertIn(">>> [ESP] stream watchdog: STREAM ON / NODES", harness.console)
 
 
 if __name__ == "__main__":
