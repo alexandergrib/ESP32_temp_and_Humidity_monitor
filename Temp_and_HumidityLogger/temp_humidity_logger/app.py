@@ -666,8 +666,8 @@ class ArduinoLoggerApp(
         )
         self.btn_connect_esp.place(x=568, y=20)
 
-        self.btn_refresh = tk.Button(top, text="Refresh", width=8, command=self.refresh_ports)
-        self.btn_refresh.place(x=690, y=20)
+        # self.btn_refresh = tk.Button(top, text="Refresh", width=8, command=self.refresh_ports)
+        # self.btn_refresh.place(x=690, y=20)
 
         # self.btn_export = tk.Button(
         #     top, text="Export CSV", width=11,
