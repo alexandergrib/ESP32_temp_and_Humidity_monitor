@@ -89,6 +89,26 @@ Packaged runtime data is stored outside the build output in:
 
 That avoids rebuilds deleting `config.ini`, `logger.db`, or exported CSV files.
 
+### Code Signing
+
+The build script can sign `dist\TempHumidityLogger\TempHumidityLogger.exe` with a Windows Authenticode code-signing certificate. Pass `-Sign` and either a PFX file, a certificate thumbprint from the Windows certificate store, or no certificate selector to let `signtool.exe` auto-select a valid certificate:
+
+```powershell
+.\build_exe.ps1 -Clean -Sign -CertificatePath "C:\secure\codesign.pfx" -CertificatePassword "pfx-password"
+```
+
+```powershell
+.\build_exe.ps1 -Clean -Sign -CertificateThumbprint "0123456789ABCDEF0123456789ABCDEF01234567"
+```
+
+The script uses SHA-256 signing and RFC 3161 timestamping with `http://timestamp.digicert.com` by default. Override the timestamp server or SignTool location if needed:
+
+```powershell
+.\build_exe.ps1 -Clean -Sign -TimestampUrl "http://timestamp.sectigo.com" -SignToolPath "C:\Program Files (x86)\Windows Kits\10\bin\x64\signtool.exe"
+```
+
+Do not commit private certificate files or passwords. The repository ignores common private signing file formats such as `.pfx`, `.p12`, `.snk`, `.key`, and `.pem`.
+
 ## Tests
 
 From the repository root:

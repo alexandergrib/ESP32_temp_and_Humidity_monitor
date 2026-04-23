@@ -21,3 +21,10 @@ Temp_and_HumidityLogger/config.ini
 Temp_and_HumidityLogger/build/
 Temp_and_HumidityLogger/dist/
 Temp_and_HumidityLogger/log*
+
+# Private signing material.
+*.pfx
+*.p12
+*.snk
+*.key
+*.pem

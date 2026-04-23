@@ -86,6 +86,20 @@ Output:
 
 The package is built as `--onedir`, not `--onefile`. Packaged runtime data is stored in `%LOCALAPPDATA%\TempHumidityLogger`, so rebuilds do not overwrite local `config.ini`, `logger.db`, or CSV exports.
 
+Sign the packaged executable with a Windows code-signing certificate:
+
+```powershell
+.\build_exe.ps1 -Clean -Sign -CertificatePath "C:\secure\codesign.pfx" -CertificatePassword "pfx-password"
+```
+
+Alternatively, use a certificate already installed in the Windows certificate store:
+
+```powershell
+.\build_exe.ps1 -Clean -Sign -CertificateThumbprint "0123456789ABCDEF0123456789ABCDEF01234567"
+```
+
+The signing step requires `signtool.exe` from the Windows SDK. If it is not on `PATH`, pass `-SignToolPath`.
+
 ## Automated Checks
 
 Run app tests, UI smoke tests, firmware static checks, and Python compile checks:

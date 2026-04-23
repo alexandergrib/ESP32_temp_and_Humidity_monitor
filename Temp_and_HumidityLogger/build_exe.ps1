@@ -1,5 +1,11 @@
 param(
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$Sign,
+    [string]$CertificatePath,
+    [string]$CertificatePassword,
+    [string]$CertificateThumbprint,
+    [string]$TimestampUrl = "http://timestamp.digicert.com",
+    [string]$SignToolPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -69,6 +75,89 @@ function Test-PythonModule {
     return ($LASTEXITCODE -eq 0)
 }
 
+function Resolve-SignTool {
+    if ($SignToolPath) {
+        if (Test-Path $SignToolPath) {
+            return (Resolve-Path $SignToolPath).Path
+        }
+        throw "SignTool not found at: $SignToolPath"
+    }
+
+    $pathSignTool = Get-Command signtool.exe -ErrorAction SilentlyContinue
+    if ($pathSignTool) {
+        return $pathSignTool.Source
+    }
+
+    $kitRoots = @(
+        (Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"),
+        (Join-Path $env:ProgramFiles "Windows Kits\10\bin")
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    $candidates = @()
+    foreach ($root in $kitRoots) {
+        $candidates += Get-ChildItem -Path $root -Recurse -Filter signtool.exe -File -ErrorAction SilentlyContinue
+    }
+
+    $preferred = $candidates |
+        Where-Object { $_.FullName -match "\\x64\\signtool\.exe$" } |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+
+    if (-not $preferred) {
+        $preferred = $candidates |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+    }
+
+    if ($preferred) {
+        return $preferred.FullName
+    }
+
+    throw "signtool.exe was not found. Install the Windows SDK or pass -SignToolPath."
+}
+
+function Invoke-CodeSign {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath
+    )
+
+    if (-not (Test-Path $FilePath)) {
+        throw "Cannot sign missing file: $FilePath"
+    }
+
+    $signtool = Resolve-SignTool
+    $signArgs = @("sign", "/fd", "SHA256", "/tr", $TimestampUrl, "/td", "SHA256")
+
+    if ($CertificatePath) {
+        if (-not (Test-Path $CertificatePath)) {
+            throw "Certificate file not found: $CertificatePath"
+        }
+        $signArgs += @("/f", $CertificatePath)
+        if ($CertificatePassword) {
+            $signArgs += @("/p", $CertificatePassword)
+        }
+    } elseif ($CertificateThumbprint) {
+        $signArgs += @("/sha1", $CertificateThumbprint)
+    } else {
+        $signArgs += "/a"
+    }
+
+    $signArgs += $FilePath
+
+    Write-Host ""
+    Write-Host "Signing executable:"
+    Write-Host "  $FilePath"
+    & $signtool @signArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Code signing failed."
+    }
+
+    & $signtool verify /pa /v $FilePath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Code signing verification failed."
+    }
+}
+
 $requiredModules = @("serial", "matplotlib", "PyInstaller")
 $missingModules = @()
 foreach ($m in $requiredModules) {
@@ -134,9 +223,18 @@ if (Test-Path $tkDir)  { $env:TK_LIBRARY  = $tkDir }
     --hidden-import serial.tools.list_ports_windows `
     temp_humidity_logger\main.py
 
+$exePath = Join-Path $distAppDir "$appName.exe"
+if ($Sign) {
+    Invoke-CodeSign -FilePath $exePath
+}
+
 Write-Host ""
 Write-Host "Build complete:"
-Write-Host "  $projectRoot\dist\TempHumidityLogger\TempHumidityLogger.exe"
+Write-Host "  $exePath"
+if ($Sign) {
+    Write-Host "Signed:"
+    Write-Host "  $exePath"
+}
 Write-Host "Libraries:"
 Write-Host "  $projectRoot\dist\TempHumidityLogger\libraries"
 Write-Host "Runtime data:"
